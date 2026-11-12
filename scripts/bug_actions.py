@@ -157,9 +157,11 @@ def render_issue_with_external_auth(
       [("render_issue_with_external", {"issueId": bid})]
   )
   body = res[0] if res else ""
+  # Plain-text prompt-injection sanitizer errors exit 0 with non-empty text
+  ok = bool(body.strip()) and not w._is_buganizer_error_or_sanitizer_output(body)
   wrapped = _wrap_untrusted_bug_content(f'issue_id="{bid}"', body)
   return {
-      "ok": bool(body),
+      "ok": ok,
       "issue_id": bid,
       "auth_scope": reason,
       "content": wrapped,
@@ -182,10 +184,12 @@ def search_bugs_with_external_auth(
       )
   ])
   body = res[0] if res else ""
+  # Plain-text prompt-injection sanitizer errors exit 0 with non-empty text
+  ok = bool(body.strip()) and not w._is_buganizer_error_or_sanitizer_output(body)
   safe_q = q.replace('"', "&quot;")
   wrapped = _wrap_untrusted_bug_content(f'query="{safe_q}"', body)
   return {
-      "ok": bool(body),
+      "ok": ok,
       "query": q,
       "max_results": limit,
       "auth_scope": "standing_authorization",

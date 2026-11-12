@@ -1320,6 +1320,44 @@ def detect_malformed_bug_footers(
   return malformed
 
 
+def _read_transcript_created_at(conv_id: str) -> str:
+  """Reads step 0 ISO `created_at` from `conv_id`'s transcript when LS evicted an archived root."""
+  for app_dir in cl.find_app_data_dirs():
+    tr_path = os.path.join(
+        app_dir, "brain", conv_id, ".system_generated", "logs", "transcript.jsonl"
+    )
+    if not os.path.isfile(tr_path):
+      continue
+    try:
+      with open(tr_path, "r", encoding="utf-8") as f:
+        obj = json.loads(f.readline() or "{}")
+      if isinstance(obj, dict) and obj.get("created_at"):
+        return str(obj["created_at"])
+    except (OSError, ValueError):
+      continue
+  return ""
+
+
+def _resolve_chain_root_created_at(
+    cid: str, meta: dict[str, Any], summaries: dict[str, Any]
+) -> str:
+  """Returns root ISO `createdAt` across handoff ancestors (`cid`, `meta`, `summaries`)."""
+  own_created = str(meta.get("createdAt") or "")
+  ancestors = cl.discover_conversation_chain(cid, include_descendants=False)
+  if ancestors and ancestors[0] != cid:
+    root_s = summaries.get(ancestors[0])
+    if isinstance(root_s, dict):
+      root_created = str(
+          ((root_s.get("trajectoryMetadata") or {}).get("createdAt")) or ""
+      )
+      if root_created:
+        return root_created
+    tr_created = _read_transcript_created_at(ancestors[0])
+    if tr_created:
+      return tr_created
+  return own_created
+
+
 def discover_bug_chats(
     include_archived: bool = False,
 ) -> dict[str, dict[str, Any]]:
@@ -1357,6 +1395,7 @@ def discover_bug_chats(
     if not bug_keys:
       continue
     chat_busy = is_chat_busy(s, "" if is_archived else title)
+    chat_created_at = _resolve_chain_root_created_at(cid, meta, summaries)
     last_mod = str(meta.get("lastModifiedTime") or meta.get("createdAt") or "")
     single_bug = len(bug_keys) == 1
     for bkey in bug_keys:
@@ -1366,6 +1405,7 @@ def discover_bug_chats(
           "title": title,
           "project_id": pid,
           "project_name": pname,
+          "chat_created_at": chat_created_at,
           "chat_last_modified": last_mod,
           "single_target": single_bug,
           "chat_busy": chat_busy,
@@ -1418,6 +1458,7 @@ def discover_active_cl_chats(
     # Ignore meta-chats in Flight Deck that mention a CL/PR as a bug example
     if pname in EXCLUDED_WATCHER_PROJECTS:
       continue
+    chat_created_at = _resolve_chain_root_created_at(cid, meta, summaries)
     last_mod = str(meta.get("lastModifiedTime") or meta.get("createdAt") or "")
 
     cls_hosts = extract_cl_ids_with_hosts(title)
@@ -1471,6 +1512,7 @@ def discover_active_cl_chats(
           "title": title,
           "project_id": pid,
           "project_name": pname,
+          "chat_created_at": chat_created_at,
           "chat_last_modified": last_mod,
           "single_target": single_target,
           "chat_busy": chat_busy,
@@ -1488,6 +1530,7 @@ def discover_active_cl_chats(
           "title": title,
           "project_id": pid,
           "project_name": pname,
+          "chat_created_at": chat_created_at,
           "chat_last_modified": last_mod,
           "single_target": state_single_target,
           "chat_busy": chat_busy,
@@ -1503,6 +1546,7 @@ def discover_active_cl_chats(
           "title": title,
           "project_id": pid,
           "project_name": pname,
+          "chat_created_at": chat_created_at,
           "chat_last_modified": last_mod,
           "single_target": single_target,
           "chat_busy": chat_busy,
@@ -1519,6 +1563,7 @@ def discover_active_cl_chats(
           "title": title,
           "project_id": pid,
           "project_name": pname,
+          "chat_created_at": chat_created_at,
           "chat_last_modified": last_mod,
           "single_target": state_single_target,
           "chat_busy": chat_busy,
@@ -1565,6 +1610,7 @@ def attach_archived_chats_to_open_changes(
       item["title"] = matched["title"]
       item["project_id"] = matched["project_id"]
       item["project_name"] = matched["project_name"]
+      item["chat_created_at"] = matched.get("chat_created_at", "")
       item["chat_last_modified"] = matched.get("chat_last_modified", "")
       item["chat_busy"] = matched.get("chat_busy", False)
       item["chat_archived"] = matched.get("chat_archived", True)
@@ -2029,6 +2075,7 @@ def link_companion_changes_to_parent_chats(
         d["title"] = parent.get("title", "")
         d["project_id"] = parent.get("project_id", "")
         d["project_name"] = parent.get("project_name", "")
+        d["chat_created_at"] = parent.get("chat_created_at", "")
         d["chat_last_modified"] = parent.get("chat_last_modified", "")
         d["chat_busy"] = parent.get("chat_busy", False)
         d["chat_archived"] = parent.get("chat_archived", False)
@@ -2547,6 +2594,7 @@ def link_bug_chats_to_unchatted_self_cls(
         if pname and pname != "Unassigned" and pname not in META_PROJECT_NAMES:
           d["project_id"] = str(bchat.get("project_id") or "")
           d["project_name"] = pname
+        d["chat_created_at"] = str(bchat.get("chat_created_at") or "")
         d["chat_last_modified"] = str(bchat.get("chat_last_modified") or "")
         d["chat_busy"] = bool(bchat.get("chat_busy"))
         d["chat_archived"] = False
@@ -2602,6 +2650,7 @@ def link_fix_changes_to_parent_chats(
         d["title"] = parent.get("title", "")
         d["project_id"] = parent.get("project_id", "")
         d["project_name"] = parent.get("project_name", "")
+        d["chat_created_at"] = parent.get("chat_created_at", "")
         d["chat_last_modified"] = parent.get("chat_last_modified", "")
         d["chat_busy"] = parent.get("chat_busy", False)
         d["chat_archived"] = parent.get("chat_archived", False)
@@ -7239,6 +7288,7 @@ def _start_pinned_chat_for_record(
   except (OSError, RuntimeError, ValueError, KeyError) as exc:
     return {"ok": False, "error": str(exc)}
 
+  now_iso = datetime.now(timezone.utc).isoformat()
   _rekey_state_item_chat(
       items, ikey, matched_key, rec, new_cid, chat_archived=False
   )
@@ -7248,7 +7298,8 @@ def _start_pinned_chat_for_record(
     rec["project_name"] = rerouted_name
   rec["chat_busy"] = True
   rec["chat_woken_ts"] = time.time()
-  rec["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
+  rec["chat_created_at"] = now_iso
+  rec["chat_last_modified"] = now_iso
   if _is_assigned_reviewer_record(rec):
     rec["review_target_ps"] = int(rec.get("patchset") or 1)
   return {
@@ -7289,16 +7340,20 @@ def _start_chat_for_bug(
       (cand or {}).get("conversation_id")
       or (cached_cid if keep_unindexed_cid else "")
   ).strip()
+  self_cl_created_at = ""
   if not active_cid:
     # Reuse a linked 1:1 self-authored CL chat, ignoring multi-bug umbrella CLs
-    self_cl_cids = [
-        str(sub.get("conversation_id") or "").strip()
-        for sub in (bug.get("linked_cls") or [])
-        if isinstance(sub, dict)
-        and sub.get("is_self")
-        and sub.get("shared_1_to_1", True)
-        and sub.get("conversation_id")
-    ]
+    self_cl_cids: list[str] = []
+    for sub in bug.get("linked_cls") or []:
+      if (
+          isinstance(sub, dict)
+          and sub.get("is_self")
+          and sub.get("shared_1_to_1", True)
+          and sub.get("conversation_id")
+      ):
+        self_cl_cids.append(str(sub.get("conversation_id") or "").strip())
+        if not self_cl_created_at and sub.get("chat_created_at"):
+          self_cl_created_at = str(sub["chat_created_at"])
     if len(set(self_cl_cids)) == 1:
       active_cid = self_cl_cids[0]
 
@@ -7306,6 +7361,11 @@ def _start_chat_for_bug(
     bug["conversation_id"] = active_cid
     if cand:
       bug["chat_archived"] = bool(cand.get("chat_archived"))
+      if cand.get("chat_created_at"):
+        bug["chat_created_at"] = str(cand["chat_created_at"])
+    elif not keep_unindexed_cid:
+      bug["chat_archived"] = False
+      bug["chat_created_at"] = self_cl_created_at
     if save:
       save_watcher_state(state)
     return {
@@ -7362,6 +7422,7 @@ def _start_chat_for_bug(
   except (OSError, RuntimeError, ValueError, KeyError) as exc:
     return {"ok": False, "error": str(exc)}
 
+  now_iso = datetime.now(timezone.utc).isoformat()
   bug["conversation_id"] = new_cid
   bug["chat_title"] = full_title
   bug["chat_archived"] = False
@@ -7370,7 +7431,8 @@ def _start_chat_for_bug(
     bug["project_name"] = rerouted_name
   bug["chat_busy"] = True
   bug["chat_woken_ts"] = time.time()
-  bug["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
+  bug["chat_created_at"] = now_iso
+  bug["chat_last_modified"] = now_iso
   # Propagate newly spawned bug chat to any unchatted self CL linked to this bug
   link_bugs_and_cls(bugs, state.setdefault("items", {}))
   if save:
@@ -8869,7 +8931,7 @@ def compute_companion_states(
 
 
 def _is_bug_bot_author(author: str) -> bool:
-  """Returns True for automated commit/CI bots whose bug comments need no human reply."""
+  """Returns True for automated commit, triage, or migration bots needing no human reply."""
   low = (author or "").strip().lower()
   if not low:
     return True
@@ -8883,10 +8945,52 @@ def _is_bug_bot_author(author: str) -> bool:
       "fluttergithubbot",
       "dependabot",
       "gemini-code-assist",
+      "issuetracker-automation",
+      "nobody@google.com",
+      "nobody@chromium.org",
+      "monorail",
+      "blunderbuss",
+      "sheriffbot",
+      "clusterfuzz",
+      "luci-bisection",
+      "chrome-security-blintz",
+      "chrome-release-blintz",
   )
   if any(tok in low for tok in bot_tokens):
     return True
-  return low.endswith(("[bot]", "-bot", ".gserviceaccount.com"))
+  return low.endswith((
+      "[bot]",
+      "-bot",
+      ".gserviceaccount.com",
+      "@prod.google.com",
+      ".prod.google.com",
+  ))
+
+
+def _is_migration_or_boilerplate_comment(body: str) -> bool:
+  """Returns True for Monorail migration notes or bulk automated status-reset boilerplate."""
+  low = (body or "").strip().lower()
+  if not low:
+    return True
+  if "[empty comment from monorail migration]" in low:
+    return True
+  if "this issue was migrated from crbug.com/" in low:
+    return True
+  if (
+      'changing status back to "new" due to feedback:' in low
+      and "many valid bugs were assigned to xooglers" in low
+  ):
+    return True
+  return low.startswith("the nextaction date has arrived:")
+
+
+def _compute_bug_comment_hash(
+    comment_num: int, author: str, ts_raw: str, body: str
+) -> str:
+  """Returns a 16-hex SHA-256 fingerprint over `(num, author, ts, normalized_body)`."""
+  norm = " ".join((body or "").split())
+  raw = f"{comment_num}|{(author or '').strip().lower()}|{(ts_raw or '').strip()}|{norm}"
+  return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _unwrap_mcp_or_json_text(raw_text: str) -> str:
@@ -9210,8 +9314,22 @@ def parse_buganizer_blocks(output_text: str) -> list[dict[str, Any]]:
   return results
 
 
-# Bump whenever parse_rendered_issue_comments changes or failed MCP renders poisoned v2 stamps
-COMMENTS_PARSER_VERSION = 3
+# Bump whenever parse_rendered_issue_comments changes or polluted stamps need silent reheal
+COMMENTS_PARSER_VERSION = 4
+
+RE_BUGANIZER_SANITIZER_OR_SYSTEM_ERR = re.compile(
+    r"(?:"
+    r"unable to return issue\b|"
+    r"unable to analyze the content for potential unsanitized prompt injection|"
+    r"the system encountered an error and was unable|"
+    r"^\s*(?:mcp error|rpc error|internal error|deadline_exceeded)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+RE_BUGANIZER_EMPTY_SEARCH = re.compile(
+    r"\b(?:no issues|0 issues?|found 0)\b", re.IGNORECASE
+)
 
 
 def _is_mcp_error_output(raw_text: str) -> bool:
@@ -9232,9 +9350,30 @@ def _is_mcp_error_output(raw_text: str) -> bool:
   return isinstance(res_obj, dict) and bool(res_obj.get("isError"))
 
 
+def _is_buganizer_error_or_sanitizer_output(raw_text: str) -> bool:
+  """Returns True when Buganizer MCP failed or returned a plain-text sanitizer error."""
+  if _is_mcp_error_output(raw_text):
+    return True
+  text = _unwrap_mcp_or_json_text(raw_text).strip()
+  if not text:
+    return False
+  # Real rendered or verbose Buganizer blocks carry an Issue ID header even if quoting errors
+  if re.search(r"(?m)^Issue ID:\s*\d+\b", text):
+    return False
+  return bool(RE_BUGANIZER_SANITIZER_OR_SYSTEM_ERR.search(text))
+
+
+def _is_empty_buganizer_search_result(raw_text: str) -> bool:
+  """Returns True when `get_bugs_with_external` explicitly reports zero matching issues."""
+  if _is_buganizer_error_or_sanitizer_output(raw_text):
+    return False
+  text = _unwrap_mcp_or_json_text(raw_text).strip()
+  return bool(text and RE_BUGANIZER_EMPTY_SEARCH.search(text))
+
+
 def _is_valid_rendered_issue_output(raw_text: str, expected_issue_id: str = "") -> bool:
   """Returns True only when `raw_text` unwrapped cleanly into the expected `Issue ID:` body."""
-  if not (raw_text or "").strip() or _is_mcp_error_output(raw_text):
+  if not (raw_text or "").strip() or _is_buganizer_error_or_sanitizer_output(raw_text):
     return False
   text = _unwrap_mcp_or_json_text(raw_text)
   # Require the rendered Issue ID header so partial responses never stamp checked_mod
@@ -9264,12 +9403,14 @@ def _bug_comments_mod_stamp(bug: dict[str, Any]) -> str:
 
 
 def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
-  """Extracts latest human vs self comment metadata and CL links from rendered bug text."""
+  """Extracts latest human vs self comment metadata, sequence watermarks, and CL links."""
   text = _unwrap_mcp_or_json_text(rendered_text)
   res: dict[str, Any] = {
       "last_human_comment_author": "",
       "last_human_comment_at": "",
       "last_human_comment_snippet": "",
+      "last_human_comment_num": 0,
+      "last_human_comment_hash": "",
       "last_self_comment_at": "",
       "comment_cl_ids": [],
       "comment_cl_urls": {},
@@ -9283,6 +9424,7 @@ def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
       u.lower() for u in SELF_GITHUB_LOGINS
   }
   for m in RE_RENDERED_ISSUE_COMMENT.finditer(text):
+    cnum = int(m.group(1))
     author = m.group(2).strip()
     author_low = author.lower()
     ts_raw = m.group(3).strip()
@@ -9297,7 +9439,7 @@ def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
     if author_low in self_lower:
       res["last_self_comment_at"] = ts_raw
       continue
-    if _is_bug_bot_author(author):
+    if _is_bug_bot_author(author) or _is_migration_or_boilerplate_comment(body):
       continue
     # Strip collapsed HTML zippy blocks before building the single-line preview
     clean_body = re.sub(r"<details[\s\S]*?</details>", "", body)
@@ -9309,10 +9451,15 @@ def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
         if ln.strip() != "---"
         and not re.match(r"^Last modified on \d{4}-\d{2}-\d{2}T\S+$", ln.strip())
     ]
-    snippet = " ".join(" ".join(clean_lines).split())[:180]
+    norm_body = " ".join(" ".join(clean_lines).split())
+    snippet = norm_body[:180]
     res["last_human_comment_author"] = author
     res["last_human_comment_at"] = ts_raw
     res["last_human_comment_snippet"] = snippet
+    res["last_human_comment_num"] = cnum
+    res["last_human_comment_hash"] = _compute_bug_comment_hash(
+        cnum, author, ts_raw, norm_body
+    )
   res["comment_cl_ids"] = list(dict.fromkeys(cl_ids))
   res["comment_cl_urls"] = cl_urls
   return res
@@ -9350,6 +9497,8 @@ def merge_bug_record_with_prev(
         "last_human_comment_author",
         "last_human_comment_at",
         "last_human_comment_snippet",
+        "last_human_comment_num",
+        "last_human_comment_hash",
         "last_self_comment_at",
         "comment_cl_ids",
         "comment_cl_urls",
@@ -9369,10 +9518,13 @@ def merge_bug_record_with_prev(
         "chat_archived",
         "chat_busy",
         "chat_woken_ts",
+        "chat_created_at",
         "chat_last_modified",
         "last_human_comment_author",
         "last_human_comment_at",
         "last_human_comment_snippet",
+        "last_human_comment_num",
+        "last_human_comment_hash",
         "last_self_comment_at",
         "comment_cl_ids",
         "comment_cl_urls",
@@ -9381,8 +9533,8 @@ def merge_bug_record_with_prev(
       # Respect empty comment fields when the caller freshly parsed comments (e.g. GitHub issues)
       if carry_key in comment_keys and carry_key in curr:
         continue
-      if carry_key not in merged or merged.get(carry_key) in ("", None, [], {}):
-        if carry_key in prev and prev[carry_key] not in ("", None):
+      if carry_key not in merged or merged.get(carry_key) in ("", 0, None, [], {}):
+        if carry_key in prev and prev[carry_key] not in ("", 0, None):
           merged[carry_key] = prev[carry_key]
     # Keep non-default project pins on chatted bugs while letting default 'Skia' re-infer
     if (
@@ -9406,13 +9558,19 @@ def _update_bug_self_assignment_state(
     *,
     has_prev_source_snapshot: bool,
     now_ts: float,
+    wm: Any = None,
 ) -> None:
   """Tracks transitions into self-assignment without triggering stampedes on seeded backlog."""
   if not _is_self_bug_assignee(str(bug.get("assignee") or "")):
     bug["seen_self_assigned"] = False
     bug["assigned_to_self_ts"] = 0.0
     return
-  prev_dict = prev if isinstance(prev, dict) else {}
+  # Fall back to persistent bug_comment_watermarks when state["bugs"] was transiently wiped
+  prev_dict = (
+      prev
+      if isinstance(prev, dict) and prev
+      else (wm if isinstance(wm, dict) else {})
+  )
   prev_was_self = bool(prev_dict) and (
       _is_self_bug_assignee(str(prev_dict.get("assignee") or ""))
       or bool(prev_dict.get("seen_self_assigned"))
@@ -9784,7 +9942,7 @@ def _evaluate_github_mention_issue(
           my_last_ts = c_ts
           my_last_iso = c_at
         continue
-      if _is_bug_bot_author(login):
+      if _is_bug_bot_author(login) or _is_migration_or_boilerplate_comment(body):
         continue
       comments.append((idx, login, body, c_at, u_at))
     elif kind in ("AssignedEvent", "ReopenedEvent"):
@@ -9842,6 +10000,13 @@ def _evaluate_github_mention_issue(
   else:
     assert best_event is not None
     _, act_iso, act_author, act_snip = best_event
+  # GitHub lacks immutable sequential comment numbers, and GraphQL timelineItems(last: 50)
+  # indices shift as events arrive; keep last_human_comment_num=0 to prevent num:49 collisions
+  act_hash = (
+      _compute_bug_comment_hash(0, act_author, act_iso, act_snip)
+      if act_author and act_iso
+      else ""
+  )
 
   num_s = str(issue.get("number") or issue_num)
   mod_raw = str(issue.get("updatedAt") or act_iso or created_raw)
@@ -9880,6 +10045,8 @@ def _evaluate_github_mention_issue(
       "last_human_comment_author": act_author,
       "last_human_comment_at": act_iso,
       "last_human_comment_snippet": act_snip,
+      "last_human_comment_num": 0,
+      "last_human_comment_hash": act_hash,
       "last_self_comment_at": my_last_iso,
   }
 
@@ -10021,6 +10188,7 @@ def fetch_github_bugs(
     last_human_author = ""
     last_human_at = ""
     last_human_snip = ""
+    last_human_hash = ""
     last_self_at = ""
     for c in d.get("comments") or []:
       if not isinstance(c, dict):
@@ -10032,11 +10200,16 @@ def fetch_github_bugs(
       if c_login.lower() in self_gh:
         last_self_at = c_at
         continue
-      if _is_bug_bot_author(c_login):
+      if _is_bug_bot_author(c_login) or _is_migration_or_boilerplate_comment(c_body):
         continue
+      norm_c_body = " ".join(c_body.split())
       last_human_author = c_login
       last_human_at = c_at
-      last_human_snip = " ".join(c_body.split())[:180]
+      last_human_snip = norm_c_body[:180]
+      # GitHub comment array indices shift if earlier comments are deleted; keep num=0
+      last_human_hash = _compute_bug_comment_hash(
+          0, c_login, c_at, norm_c_body
+      )
 
     mod_raw = str(d.get("updatedAt") or d.get("createdAt") or "")
     mod_et, mod_age = format_et_and_age(mod_raw)
@@ -10077,6 +10250,8 @@ def fetch_github_bugs(
         "last_human_comment_author": last_human_author,
         "last_human_comment_at": last_human_at,
         "last_human_comment_snippet": last_human_snip,
+        "last_human_comment_num": 0,
+        "last_human_comment_hash": last_human_hash,
         "last_self_comment_at": last_self_at,
     })
 
@@ -10244,10 +10419,15 @@ def link_bugs_and_cls(
             or not bchat.get("chat_archived")
             or bug.get("conversation_id") == bchat["conversation_id"]
         ):
+          prev_bcid = str(bug.get("conversation_id") or "")
           bug["conversation_id"] = bchat["conversation_id"]
           bug["chat_title"] = bchat.get("title", "")
           bug["chat_archived"] = bool(bchat.get("chat_archived"))
           bug["chat_busy"] = bool(bchat.get("chat_busy"))
+          if bchat.get("chat_created_at"):
+            bug["chat_created_at"] = bchat["chat_created_at"]
+          elif prev_bcid != bchat["conversation_id"]:
+            bug["chat_created_at"] = ""
           bug["chat_last_modified"] = bchat.get("chat_last_modified", "")
           if bchat.get("project_name") not in META_PROJECT_NAMES:
             bug["project_id"] = bchat.get("project_id", "")
@@ -10338,6 +10518,7 @@ def link_bugs_and_cls(
       if not shared_with_self_cl:
         bug["conversation_id"] = ""
         bug["chat_title"] = ""
+        bug["chat_created_at"] = ""
         bug["chat_archived"] = False
         bug["chat_busy"] = False
 
@@ -10370,6 +10551,8 @@ def link_bugs_and_cls(
           )
           rec["single_target"] = len(self_ikeys) == 1
           rec["chat_busy"] = bool(bug.get("chat_busy"))
+          if bug.get("chat_created_at"):
+            rec["chat_created_at"] = str(bug["chat_created_at"])
           cl_entries_by_ikey[ik] = [(f"{ik}@{bcid}", rec)]
 
   # Pass 2: Propagate an active 1:1 self-authored CL chat onto its unchatted parent bug;
@@ -10399,6 +10582,7 @@ def link_bugs_and_cls(
         bug["conversation_id"] = str(chosen["conversation_id"])
         bug["chat_archived"] = False
         bug["chat_busy"] = any(bool(r.get("chat_busy")) for _, r in self_chatted)
+        bug["chat_created_at"] = str(chosen.get("chat_created_at") or "")
       if (
           bug.get("project_name") in ("", "Unassigned", None)
           and chosen.get("project_name")
@@ -10440,6 +10624,7 @@ def link_bugs_and_cls(
             "is_self": bool(rec.get("is_self")),
             "is_wip": bool(rec.get("is_wip") or rec.get("is_draft")),
             "shared_1_to_1": len(cl_to_bugs.get(ik, [])) <= 1,
+            "chat_created_at": str(rec.get("chat_created_at") or ""),
             "in_needs_you": bool(
                 rec.get("in_my_attention")
                 or (rec.get("merge_conflict") and rec.get("is_self"))
@@ -12079,7 +12264,13 @@ def classify_bug_status(
       ),
       default=0.0,
   )
-  comment_ack_ts = max(effective_ack_ts, non_wip_self_cl_ts)
+  # Active bug triage chats implicitly acknowledge historical comments older than chat creation
+  chat_created_ts = (
+      _parse_ts(bug.get("chat_created_at"))
+      if str(bug.get("conversation_id") or "").strip()
+      else 0.0
+  )
+  comment_ack_ts = max(effective_ack_ts, non_wip_self_cl_ts, chat_created_ts)
 
   # Issues pulled in only via a CL reference require prior participation or an explicit mention
   cl_only_bug = (
@@ -12809,6 +13000,203 @@ def _has_unchatted_archived_bug_project(
   )
 
 
+def _seed_bug_watermarks_from_cached_bugs(
+    bug_watermarks: dict[str, Any], prev_bugs: dict[str, Any], now_ts: float
+) -> None:
+  """Populates missing `bug_watermarks` keys in place from `prev_bugs` (`now_ts` fallback)."""
+  for bkey, prev_b in prev_bugs.items():
+    if not isinstance(prev_b, dict) or bkey in bug_watermarks:
+      continue
+    prev_checked = str(prev_b.get("comments_checked_major_mod") or "")
+    is_gh = prev_b.get("source") == "github"
+    prev_h_ts = _parse_ts(prev_b.get("last_human_comment_at"))
+    prev_cid = str(prev_b.get("conversation_id") or "").strip()
+    prev_chat_ts = _parse_ts(prev_b.get("chat_created_at")) if prev_cid else 0.0
+    # Never backdate watch_since_ts to historical prev_h_ts so pre-R96 entries stay anchored
+    watch_ts = prev_chat_ts or now_ts
+    bug_watermarks[bkey] = {
+        "watch_since_ts": watch_ts,
+        "chat_cid": prev_cid,
+        "chat_watch_since_ts": (prev_chat_ts or now_ts) if prev_cid else 0.0,
+        "baseline_seeded": bool(prev_checked) or is_gh,
+        "seen_self_assigned": bool(prev_b.get("seen_self_assigned"))
+        or _is_self_bug_assignee(str(prev_b.get("assignee") or "")),
+        "assigned_to_self_ts": float(prev_b.get("assigned_to_self_ts") or 0.0),
+        "max_human_comment_ts": prev_h_ts if (bool(prev_checked) or is_gh) else 0.0,
+        "notified_keys": [],
+    }
+
+
+def _comment_dedup_tokens(bug: dict[str, Any]) -> list[str]:
+  """Builds stable per-comment deduplication keys over number, timestamp+author, and hash."""
+  tokens: list[str] = []
+  cnum = int(bug.get("last_human_comment_num") or 0)
+  # Only Buganizer comments have immutable sequence numbers; GitHub issues keep cnum == 0
+  if cnum > 0:
+    tokens.append(f"num:{cnum}")
+  h_at = str(bug.get("last_human_comment_at") or "").strip()
+  h_author = str(bug.get("last_human_comment_author") or "").strip().lower()
+  if h_at:
+    tokens.append(f"ts:{h_at}|{h_author}")
+  h_hash = str(bug.get("last_human_comment_hash") or "").strip()
+  if h_hash:
+    tokens.append(f"hash:{h_hash}")
+  return tokens
+
+
+def _merge_bug_watermark_entry(dst: dict[str, Any], src: dict[str, Any]) -> None:
+  """Monotonically merges `src` into `dst` in place across watermarks and dedup tokens."""
+  d_ws = float(dst.get("watch_since_ts") or 0.0)
+  s_ws = float(src.get("watch_since_ts") or 0.0)
+  # Keep the earliest watch_since_ts so wipes never advance the historical comment cutoff
+  if s_ws > 0.0 and (d_ws <= 0.0 or s_ws < d_ws):
+    dst["watch_since_ts"] = s_ws
+  dst["baseline_seeded"] = bool(dst.get("baseline_seeded")) or bool(
+      src.get("baseline_seeded")
+  )
+  # Preserve disk assignment baseline only when the in-flight sync lacked an entry for the bug
+  if "seen_self_assigned" not in dst and "seen_self_assigned" in src:
+    dst["seen_self_assigned"] = bool(src.get("seen_self_assigned"))
+    dst["assigned_to_self_ts"] = float(src.get("assigned_to_self_ts") or 0.0)
+  dst["max_human_comment_ts"] = max(
+      float(dst.get("max_human_comment_ts") or 0.0),
+      float(src.get("max_human_comment_ts") or 0.0),
+  )
+  s_cid = str(src.get("chat_cid") or "").strip()
+  d_cid = str(dst.get("chat_cid") or "").strip()
+  # Keep per-chat watch watermark monotonic only while bound to the same conversation ID
+  if s_cid and (not d_cid or d_cid == s_cid):
+    dst["chat_cid"] = s_cid
+    dst["chat_watch_since_ts"] = max(
+        float(dst.get("chat_watch_since_ts") or 0.0),
+        float(src.get("chat_watch_since_ts") or 0.0),
+    )
+  combined = list(
+      dict.fromkeys([
+          *(str(k) for k in (dst.get("notified_keys") or []) if k),
+          *(str(k) for k in (src.get("notified_keys") or []) if k),
+      ])
+  )
+  dst["notified_keys"] = combined[-64:]
+
+
+def _process_bug_comment_wakeup(
+    bkey: str,
+    bug: dict[str, Any],
+    prev_b: dict[str, Any],
+    wm: dict[str, Any],
+    *,
+    now_ts: float,
+    wake_chats: bool,
+    busy_cids: set[str],
+    events: list[dict[str, Any]],
+) -> None:
+  """Updates `wm` in place and wakes `bug`'s active chat once on new human comments."""
+  if float(wm.get("watch_since_ts") or 0.0) <= 0.0:
+    wm["watch_since_ts"] = now_ts
+  cur_cid = str(bug.get("conversation_id") or "").strip()
+  chat_created_ts = _parse_ts(bug.get("chat_created_at")) if cur_cid else 0.0
+  # Anchor chat_watch_since_ts whenever a chat attaches or lacked an initial timestamp
+  if cur_cid and wm.get("chat_cid") != cur_cid:
+    wm["chat_cid"] = cur_cid
+    wm["chat_watch_since_ts"] = chat_created_ts or now_ts
+  elif cur_cid and (
+      chat_created_ts > float(wm.get("chat_watch_since_ts") or 0.0)
+      or float(wm.get("chat_watch_since_ts") or 0.0) <= 0.0
+  ):
+    wm["chat_watch_since_ts"] = chat_created_ts or now_ts
+  wm["seen_self_assigned"] = bool(bug.get("seen_self_assigned"))
+  wm["assigned_to_self_ts"] = float(bug.get("assigned_to_self_ts") or 0.0)
+  # Security merge requests and SkoreText-only external bugs skip bug-triage chat wakeups
+  if bug.get("is_security_merge_request") or _is_skoretext_cl_only_external_bug(bug):
+    return
+  human_ts = _parse_ts(bug.get("last_human_comment_at"))
+  # Require human_ts > max(self_ts, acked_ts, chat_created_ts) so historical notes stay silent
+  unacked_human_comment = human_ts > max(
+      _parse_ts(bug.get("last_self_comment_at")),
+      float(bug.get("acked_ts") or 0.0),
+      chat_created_ts,
+  )
+  # Suppress comment wakeups when COMMENTS_PARSER_VERSION re-renders an unchanged bug
+  prev_checked = str(prev_b.get("comments_checked_major_mod") or "")
+  is_parser_reheal = (
+      bool(prev_checked)
+      and not prev_checked.startswith(f"v{COMMENTS_PARSER_VERSION}:")
+      and bug.get("modified_time") == prev_b.get("modified_time")
+  )
+  comments_ready = (
+      bug.get("source") == "github"
+      or bool(str(bug.get("comments_checked_major_mod") or "").strip())
+  )
+  was_seeded = bool(wm.get("baseline_seeded"))
+  # Seed the initial rendered comment snapshot silently before enabling comment wakeups
+  if comments_ready and not was_seeded:
+    wm["baseline_seeded"] = True
+  base_cutoff_ts = max(
+      float(wm.get("watch_since_ts") or 0.0),
+      float(wm.get("chat_watch_since_ts") or 0.0) if cur_cid else 0.0,
+      chat_created_ts,
+  )
+  max_seen_ts = float(wm.get("max_human_comment_ts") or 0.0)
+  notified_list = [str(k) for k in (wm.get("notified_keys") or []) if k]
+  dedup_tokens = _comment_dedup_tokens(bug)
+  already_notified = bool(dedup_tokens) and any(
+      tok in notified_list for tok in dedup_tokens
+  )
+  # Allow human_ts == max_seen_ts when not already_notified so same-second GitHub replies wake
+  eligible_wakeup = (
+      was_seeded
+      and not is_parser_reheal
+      and bool(cur_cid)
+      and not bug.get("chat_archived")
+      and bool(bug.get("needs_you"))
+      and human_ts > base_cutoff_ts
+      and human_ts >= max_seen_ts
+      and unacked_human_comment
+      and not already_notified
+  )
+  if not eligible_wakeup:
+    if comments_ready and human_ts > 0.0:
+      wm["max_human_comment_ts"] = max(max_seen_ts, human_ts)
+    return
+  # Defer advancing max_human_comment_ts on dry/non-waking polls so the next waking poll delivers
+  if not wake_chats:
+    return
+  wmsg = (
+      f"[BUG-WATCHER] 💬 Новый комментарий в {bug.get('short_id')} "
+      f"('{bug.get('title')}') от {bug.get('last_human_comment_author')}: "
+      f"{bug.get('last_human_comment_snippet')}. Проведи анализ по bug-triage "
+      "(~/.gemini/config/skills/bug-triage/SKILL.md), при необходимости обнови/создай "
+      "WIP CL (PS1 = тест, PS2 = фикс) и подготовь черновик ответа."
+  )
+  was_quota_held = bool(
+      _check_profile_quota_hold(_resolve_record_profile(cur_cid))[0]
+  )
+  sent = wake_conversation(cur_cid, wmsg, item_key=bkey)
+  if sent:
+    busy_cids.add(cur_cid)
+  # Advance watermark and dedup ledger only once delivered or queued in quota_hold
+  if sent or was_quota_held:
+    wm["max_human_comment_ts"] = max(max_seen_ts, human_ts)
+    wm["notified_keys"] = list(
+        dict.fromkeys([*notified_list, *dedup_tokens])
+    )[-64:]
+    events.insert(
+        0,
+        {
+            "id": f"ev-bug-{int(now_ts * 1000)}-{bug.get('id')}",
+            "time": now_et_str(),
+            "item_key": bkey,
+            "target_id": str(bug.get("id") or ""),
+            "conversation_id": cur_cid,
+            "project_name": str(bug.get("project_name") or "Skia"),
+            "critical": False,
+            "message": wmsg,
+        },
+    )
+    del events[50:]
+
+
 def sync_bugs_into_state(
     state: dict[str, Any],
     *,
@@ -12859,6 +13247,11 @@ def sync_bugs_into_state(
         ref_gh_nums.add(bkey.split("#", 1)[1])
 
   now_ts = time.time()
+  bug_watermarks = state.setdefault("bug_comment_watermarks", {})
+  if not isinstance(bug_watermarks, dict):
+    bug_watermarks = {}
+    state["bug_comment_watermarks"] = bug_watermarks
+  _seed_bug_watermarks_from_cached_bugs(bug_watermarks, prev_bugs, now_ts)
   last_bug_ts = float(state.get("last_bug_sync_ts") or 0.0)
   # Bypass 5-min TTL when an own CL/PR references a bug missing from cached state
   has_uncached_self_cl_bug = any(bkey not in prev_bugs for bkey in self_cl_bkeys)
@@ -12951,14 +13344,22 @@ def sync_bugs_into_state(
   mcp_outputs = call_buganizer_mcp_batch(mcp_calls)
   bz_open_raw = mcp_outputs[0] if mcp_outputs else ""
   bz_closed_raw = mcp_outputs[1] if len(mcp_outputs) > 1 else ""
-  fetched_bz = parse_buganizer_blocks(bz_open_raw) + parse_buganizer_blocks(
-      bz_closed_raw
+  open_parsed = parse_buganizer_blocks(bz_open_raw)
+  closed_parsed = (
+      []
+      if _is_buganizer_error_or_sanitizer_output(bz_closed_raw)
+      else parse_buganizer_blocks(bz_closed_raw)
   )
-  # Fall back to issues-cli and retain cached Buganizer bugs only when primary open_q failed
-  bz_failed = not bz_open_raw.strip() or _is_mcp_error_output(bz_open_raw)
-  if not fetched_bz and bz_failed:
-    fetched_bz = fetch_buganizer_fallback(open_q, limit=150)
-  bz_outage = bz_failed and not fetched_bz
+  # Fall back to issues-cli and retain cached Buganizer bugs whenever primary open_q failed
+  bz_failed = (
+      not bz_open_raw.strip()
+      or _is_buganizer_error_or_sanitizer_output(bz_open_raw)
+      or (not open_parsed and not _is_empty_buganizer_search_result(bz_open_raw))
+  )
+  if not open_parsed and bz_failed:
+    open_parsed = fetch_buganizer_fallback(open_q, limit=150)
+  fetched_bz = open_parsed + closed_parsed
+  bz_outage = bz_failed and not open_parsed
 
   primary_self_bkeys = {str(b.get("bug_key") or "") for b in fetched_bz}
   seen_bz_ids = {str(b.get("id") or "") for b in fetched_bz}
@@ -12987,7 +13388,9 @@ def sync_bugs_into_state(
     extra_out = call_buganizer_mcp_batch(
         [("get_bugs_with_external", {"query": id_q, "maxResults": 50, "verbose": True})]
     )
-    fetched_bz.extend(parse_buganizer_blocks(extra_out[0]))
+    extra_raw = extra_out[0] if extra_out else ""
+    if not _is_buganizer_error_or_sanitizer_output(extra_raw):
+      fetched_bz.extend(parse_buganizer_blocks(extra_raw))
 
   all_bugs: dict[str, dict[str, Any]] = {}
   render_cands: list[tuple[tuple[int, int, int, float], str]] = []
@@ -13001,6 +13404,7 @@ def sync_bugs_into_state(
         prev_entry,
         has_prev_source_snapshot=has_prev_bz,
         now_ts=now_ts,
+        wm=bug_watermarks.get(bkey),
     )
     # Recompute collaborator role from live query membership so removed/reassigned bugs drop out
     merged_b["is_collaborator"] = bool(
@@ -13080,12 +13484,14 @@ def sync_bugs_into_state(
     bkey = gh_b["bug_key"]
     if gh_b.get("from_self_query"):
       primary_self_bkeys.add(bkey)
-    merged_gh = merge_bug_record_with_prev(gh_b, prev_bugs.get(bkey))
+    prev_gh = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else None
+    merged_gh = merge_bug_record_with_prev(gh_b, prev_gh)
     _update_bug_self_assignment_state(
         merged_gh,
-        prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else None,
+        prev_gh,
         has_prev_source_snapshot=has_prev_gh,
         now_ts=now_ts,
+        wm=bug_watermarks.get(bkey),
     )
     merged_gh["is_collaborator"] = False
     merged_gh["is_mentioned"] = bool(gh_b.get("is_mentioned"))
@@ -13181,59 +13587,21 @@ def sync_bugs_into_state(
   auto_started_bugs = 0
 
   for bkey, bug in retained_bugs.items():
-    # Security merge requests and SkoreText-only external bugs skip bug-triage chat wakeups
-    if bug.get("is_security_merge_request") or _is_skoretext_cl_only_external_bug(bug):
-      continue
+    wm = bug_watermarks.get(bkey)
+    if not isinstance(wm, dict):
+      wm = {}
+      bug_watermarks[bkey] = wm
     prev_b = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
-    # Wake active bug chat when a new human comment arrives upstream
-    # Require human_ts > max(self_ts, acked_ts) so self replies or non-comment Needs Me never wake
-    unacked_human_comment = _parse_ts(bug.get("last_human_comment_at")) > max(
-        _parse_ts(bug.get("last_self_comment_at")),
-        float(bug.get("acked_ts") or 0.0),
+    _process_bug_comment_wakeup(
+        bkey,
+        bug,
+        prev_b,
+        wm,
+        now_ts=now_ts,
+        wake_chats=wake_chats,
+        busy_cids=busy_cids,
+        events=events,
     )
-    # Suppress comment wakeups when COMMENTS_PARSER_VERSION re-renders an unchanged bug
-    prev_checked = str(prev_b.get("comments_checked_major_mod") or "")
-    is_parser_reheal = (
-        bool(prev_checked)
-        and not prev_checked.startswith(f"v{COMMENTS_PARSER_VERSION}:")
-        and bug.get("modified_time") == prev_b.get("modified_time")
-    )
-    if (
-        wake_chats
-        and not is_parser_reheal
-        and bug.get("conversation_id")
-        and not bug.get("chat_archived")
-        and bug.get("needs_you")
-        and bug.get("last_human_comment_at")
-        and unacked_human_comment
-        and bug.get("last_human_comment_at") != prev_b.get("last_human_comment_at")
-        and prev_b
-    ):
-      wmsg = (
-          f"[BUG-WATCHER] 💬 Новый комментарий в {bug.get('short_id')} "
-          f"('{bug.get('title')}') от {bug.get('last_human_comment_author')}: "
-          f"{bug.get('last_human_comment_snippet')}. Проведи анализ по bug-triage "
-          "(~/.gemini/config/skills/bug-triage/SKILL.md), при необходимости обнови/создай "
-          "WIP CL (PS1 = тест, PS2 = фикс) и подготовь черновик ответа."
-      )
-      wcid = str(bug["conversation_id"])
-      # Only mark the chat busy when wake_conversation actually sent the message (not quota-held)
-      if wake_conversation(wcid, wmsg, item_key=bkey):
-        busy_cids.add(wcid)
-      events.insert(
-          0,
-          {
-              "id": f"ev-bug-{int(now_ts * 1000)}-{bug.get('id')}",
-              "time": now_et_str(),
-              "item_key": bkey,
-              "target_id": str(bug.get("id") or ""),
-              "conversation_id": wcid,
-              "project_name": str(bug.get("project_name") or "Skia"),
-              "critical": False,
-              "message": wmsg,
-          },
-      )
-      del events[50:]
 
   # Launch security vulnerabilities first, then P0 -> P4, newest activity first
   pri_ranks = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}
@@ -13693,6 +14061,22 @@ def merge_concurrent_state_mutations(
         if k not in b_map or b_map.get(k) != v:
           s_map[k] = v
 
+  disk_wm = disk_state.get("bug_comment_watermarks")
+  if isinstance(disk_wm, dict):
+    state_wm = state.setdefault("bug_comment_watermarks", {})
+    if not isinstance(state_wm, dict):
+      state_wm = {}
+      state["bug_comment_watermarks"] = state_wm
+    for bkey, dw in disk_wm.items():
+      if not isinstance(dw, dict):
+        continue
+      sw = state_wm.get(bkey)
+      # Deep-copy disk-only entries and monotonically merge shared entries across sync wipes
+      if not isinstance(sw, dict):
+        state_wm[bkey] = json.loads(json.dumps(dw))
+      else:
+        _merge_bug_watermark_entry(sw, dw)
+
   # 3. Preserve concurrent bug mutations (ack, merge reassignment, collaborator, start_chat)
   disk_bugs = disk_state.get("bugs")
   state_bugs = state.get("bugs")
@@ -13747,6 +14131,7 @@ def merge_concurrent_state_mutations(
             "project_name",
             "chat_title",
             "chat_woken_ts",
+            "chat_created_at",
             "chat_last_modified",
         ):
           if dbug.get(cfield):
@@ -13783,6 +14168,7 @@ def merge_concurrent_state_mutations(
               "project_id",
               "project_name",
               "chat_woken_ts",
+              "chat_created_at",
               "chat_last_modified",
           ):
             if ditem.get(pfield):
@@ -14772,6 +15158,9 @@ def _sync_once_locked(
             meta = s_tail.get("trajectoryMetadata") or {}
             record["title"] = tail_title
             record["chat_archived"] = tail_arch
+            record["chat_created_at"] = _resolve_chain_root_created_at(
+                cid, meta, ls_summaries
+            )
             record["chat_last_modified"] = str(
                 meta.get("lastModifiedTime") or meta.get("createdAt") or ""
             )

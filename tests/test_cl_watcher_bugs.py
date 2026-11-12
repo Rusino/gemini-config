@@ -2578,7 +2578,739 @@ vm.runInThisContext(scriptContent + '\n' + harness);
       self.assertEqual(merged_item["project_id"], "p-skia")
       self.assertEqual(merged_item["project_name"], "Skia")
 
+  # Checks plain-text Buganizer sanitizer errors never wipe bug watermarks or report ok=True
+  def test_sanitizer_error_preserves_watermarks_across_batch_renders_and_bug_actions(
+      self,
+  ) -> None:
+    import bug_actions  # pylint: disable=g-import-not-at-top
+
+    sanitizer_err = (
+        "Unable to return issue 41236341. The system encountered an error and was "
+        "unable to analyze the content for potential unsanitized prompt injection."
+    )
+    with mock.patch.object(w, "call_buganizer_mcp_batch", return_value=[sanitizer_err]):
+      r_res = bug_actions.render_issue_with_external_auth("41236341", state={"bugs": {}})
+      s_res = bug_actions.search_bugs_with_external_auth("id:41236341")
+    self.assertFalse(r_res["ok"])
+    self.assertFalse(s_res["ok"])
+
+    now_ts = w._parse_ts("2026-11-12T15:00:00Z")
+    open_blocks: list[str] = []
+    bugs_init: dict[str, dict[str, object]] = {}
+    chats_map: dict[str, dict[str, object]] = {}
+    rendered_by_id: dict[str, str] = {}
+    for idx in range(10):
+      bid = str(41236340 + idx)
+      bkey = f"buganizer:{bid}"
+      cid = f"cid-{bid}"
+      mod_iso = "2026-05-26T16:04:35.352Z"
+      open_blocks.append(
+          f"Issue ID: {bid}\nComponent ID: 1457031\nAssignee: jlavrova@google.com\n"
+          f"Status: ASSIGNED\nPriority: P2\nIssue Type: BUG\nTitle: Bug {bid}\n"
+          f"Created Time: 2020-01-01T00:00:00Z\nModified Time: {mod_iso}\n"
+          f"Major Modified Time: 2026-04-30T12:00:00Z\n"
+      )
+      rendered_by_id[bid] = (
+          f"Issue ID: {bid}\nStatus: ASSIGNED\n"
+          f"Comment #2 by colleague@google.com at 2023-06-01T10:00:00Z:\n"
+          f"Old pre-watch triage note on {bid}.\n"
+      )
+      bugs_init[bkey] = {
+          "bug_key": bkey,
+          "source": "buganizer",
+          "id": bid,
+          "short_id": f"crbug/{bid}",
+          "title": f"Bug {bid}",
+          "status": "ASSIGNED",
+          "priority": "P2",
+          "assignee": "jlavrova@google.com",
+          "modified_time": mod_iso,
+          "major_modified_time": "2026-04-30T12:00:00Z",
+          "conversation_id": cid,
+          "chat_created_at": "2026-11-12T03:14:18Z",
+          "last_human_comment_author": "colleague@google.com",
+          "last_human_comment_at": "2023-06-01T10:00:00Z",
+          "last_human_comment_snippet": f"Old pre-watch triage note on {bid}.",
+          "comments_checked_major_mod": (
+              f"v{w.COMMENTS_PARSER_VERSION}:{mod_iso}|2026-04-30T12:00:00Z"
+          ),
+      }
+      chats_map[bkey] = {
+          "bug_key": bkey,
+          "conversation_id": cid,
+          "title": f"[10:00] \u29bf crbug/{bid} triage",
+          "project_id": "p-skia",
+          "project_name": "Skia",
+          "chat_created_at": "2026-11-12T03:14:18Z",
+          "chat_last_modified": "2026-11-12T03:14:18Z",
+          "chat_archived": False,
+          "chat_busy": False,
+      }
+
+    state: dict[str, object] = {
+        "items": {},
+        "bugs": bugs_init,
+        "review_claims": {},
+        "events": [],
+    }
+    open_joined = "\n---\n".join(open_blocks)
+
+    def healthy_mcp(calls: list[tuple[str, dict[str, object]]]) -> list[str]:
+      outs: list[str] = []
+      for name, args in calls:
+        if name == "get_bugs_with_external":
+          q = str(args.get("query") or "")
+          outs.append(open_joined if "status:open" in q and "-status:open" not in q else "")
+        elif name == "render_issue_with_external":
+          outs.append(rendered_by_id.get(str(args.get("issueId") or ""), ""))
+        else:
+          outs.append("")
+      return outs
+
+    woken: list[tuple[str, str]] = []
+    with (
+        mock.patch.object(w, "fetch_github_bugs", return_value=[]),
+        mock.patch.object(w, "fetch_buganizer_fallback", return_value=[]),
+        mock.patch.object(w, "discover_bug_chats", return_value=chats_map),
+        mock.patch.object(
+            w,
+            "wake_conversation",
+            side_effect=lambda cid, msg, **_kw: (woken.append((cid, msg)) or True),
+        ),
+    ):
+      with (
+          mock.patch.object(w.time, "time", return_value=now_ts),
+          mock.patch.object(
+              w,
+              "call_buganizer_mcp_batch",
+              side_effect=lambda calls: [
+                  (
+                      "Issue ID: 49999999\nComponent ID: 1457031\n"
+                      "Assignee: jlavrova@google.com\nStatus: FIXED\nPriority: P2\n"
+                      "Issue Type: BUG\nTitle: Recently closed bug\n"
+                      "Created Time: 2026-11-01T00:00:00Z\n"
+                      "Modified Time: 2026-11-12T10:00:00Z\n"
+                      "Major Modified Time: 2026-11-12T10:00:00Z\n"
+                  )
+                  if "-status:open" in str(args.get("query") or "")
+                  else sanitizer_err
+                  for _, args in calls
+              ],
+          ),
+      ):
+        w.sync_bugs_into_state(state, force=True, wake_chats=True, proj_names={"p-skia": "Skia"})
+      for idx in range(10):
+        self.assertIn(f"buganizer:{41236340 + idx}", state["bugs"])
+
+      for step in range(1, 4):
+        with (
+            mock.patch.object(w.time, "time", return_value=now_ts + step * 180.0),
+            mock.patch.object(w, "call_buganizer_mcp_batch", side_effect=healthy_mcp),
+        ):
+          w.sync_bugs_into_state(state, force=True, wake_chats=True, proj_names={"p-skia": "Skia"})
+    self.assertEqual(woken, [])
+
+  # Checks migration/bot comments are ignored and polluted v3 issuetracker-automation heals silently
+  def test_migration_and_automation_comments_ignored_and_polluted_v3_heals_silently(
+      self,
+  ) -> None:
+    rendered_41236341 = (
+        "Issue ID: 41236341\n"
+        "Status: ASSIGNED\n"
+        "Comment #12 by reporter@chromium.org at 2018-03-11T09:00:00Z:\n"
+        "Original repro HTML attached.\n\n"
+        "Comment #13 by johnstiles@google.com at 2021-01-05T16:49:12Z:\n"
+        "[Empty comment from Monorail migration]\n\n"
+        "Comment #14 by rmistry@google.com at 2022-05-01T12:00:00Z:\n"
+        'Changing status back to "New" due to feedback:\n'
+        "* Many valid bugs were assigned to Xooglers and shouldn't be obsolete.\n\n"
+        "Comment #15 by issuetracker-automation@google.com at 2020-10-20T21:01:58Z:\n"
+        "This issue was migrated from crbug.com/chromium/580768?no_tracker_redirect=1\n"
+        "[Monorail components added to Component Tags custom field.]\n\n"
+        "Comment #16 by nobody@google.com at 2021-07-16T12:00:09Z:\n"
+        "The NextAction date has arrived: 2021-07-16\n\n"
+        "Comment #17 by blunderbuss-prod@prod.google.com at 2026-11-12T10:30:00Z:\n"
+        "Auto-routing crash report.\n"
+    )
+    cinfo = w.parse_rendered_issue_comments(rendered_41236341)
+    self.assertEqual(cinfo["last_human_comment_author"], "reporter@chromium.org")
+    self.assertEqual(cinfo["last_human_comment_at"], "2018-03-11T09:00:00Z")
+    self.assertEqual(cinfo["last_human_comment_num"], 12)
+    self.assertNotIn("max_comment_num", cinfo)
+    self.assertNotIn("max_comment_at", cinfo)
+
+    now_ts = w._parse_ts("2026-11-12T18:00:00Z")
+    open_412 = (
+        "Issue ID: 41236341\nComponent ID: 1457031\nAssignee: jlavrova@google.com\n"
+        "Status: ASSIGNED\nPriority: P2\nIssue Type: BUG\nTitle: Paint order text outline\n"
+        "Created Time: 2016-01-20T00:00:00Z\nModified Time: 2026-05-26T16:04:35.352Z\n"
+        "Major Modified Time: 2026-04-30T12:00:09.282Z\n"
+    )
+    state: dict[str, object] = {
+        "items": {},
+        "bugs": {
+            "buganizer:41236341": {
+                "bug_key": "buganizer:41236341",
+                "source": "buganizer",
+                "id": "41236341",
+                "short_id": "crbug/41236341",
+                "title": "Paint order text outline",
+                "status": "ASSIGNED",
+                "priority": "P2",
+                "assignee": "jlavrova@google.com",
+                "modified_time": "2026-05-26T16:04:35.352Z",
+                "major_modified_time": "2026-04-30T12:00:09.282Z",
+                "conversation_id": "6d88e938-5890-4ac2-887c-6931a88d6868",
+                "chat_archived": False,
+                "needs_you": True,
+                "lane": "you",
+                "why_needs_you": "New comment from issuetracker-automation@google.com",
+                "last_human_comment_author": "issuetracker-automation@google.com",
+                "last_human_comment_at": "2020-10-20T21:01:58Z",
+                "last_human_comment_snippet": "This issue was migrated from crbug.com/...",
+                "comments_checked_major_mod": (
+                    "v3:2026-05-26T16:04:35.352Z|2026-04-30T12:00:09.282Z"
+                ),
+            }
+        },
+        "events": [],
+    }
+
+    def mcp_412(calls: list[tuple[str, dict[str, object]]]) -> list[str]:
+      outs: list[str] = []
+      for name, args in calls:
+        if name == "get_bugs_with_external":
+          q = str(args.get("query") or "")
+          outs.append(open_412 if "status:open" in q and "-status:open" not in q else "")
+        elif name == "render_issue_with_external":
+          outs.append(rendered_41236341)
+        else:
+          outs.append("")
+      return outs
+
+    chats = {
+        "buganizer:41236341": {
+            "bug_key": "buganizer:41236341",
+            "conversation_id": "6d88e938-5890-4ac2-887c-6931a88d6868",
+            "title": "[22:14] \u29bf crbug/41236341 text outline paint-order",
+            "project_id": "p-skia",
+            "project_name": "Skia",
+            "chat_created_at": "2026-11-12T03:14:18Z",
+            "chat_last_modified": "2026-11-12T03:14:18Z",
+            "chat_archived": False,
+            "chat_busy": False,
+        }
+    }
+    with (
+        mock.patch.object(w.time, "time", return_value=now_ts),
+        mock.patch.object(w, "call_buganizer_mcp_batch", side_effect=mcp_412),
+        mock.patch.object(w, "fetch_github_bugs", return_value=[]),
+        mock.patch.object(w, "discover_bug_chats", return_value=chats),
+        mock.patch.object(w, "wake_conversation") as wake_mock,
+    ):
+      w.sync_bugs_into_state(state, force=True, wake_chats=True, proj_names={"p-skia": "Skia"})
+
+    healed = state["bugs"]["buganizer:41236341"]
+    self.assertFalse(healed["needs_you"])
+    self.assertEqual(healed["lane"], "assigned")
+    wake_mock.assert_not_called()
+
+  # Checks deferred first render and historical pre-watch comments never wake an active bug chat
+  def test_deferred_first_render_and_historical_cutoff_never_wake_active_bug_chat(self) -> None:
+    now_ts = w._parse_ts("2026-11-12T18:00:00Z")
+    open_old = (
+        "Issue ID: 40045440\nComponent ID: 1457031\nAssignee: jlavrova@google.com\n"
+        "Status: ASSIGNED\nPriority: P2\nIssue Type: BUG\nTitle: Wrong text wrapper behavior\n"
+        "Created Time: 2022-01-10T00:00:00Z\nModified Time: 2026-11-12T17:30:00Z\n"
+        "Major Modified Time: 2023-08-14T15:00:00Z\n"
+    )
+    rendered_old = (
+        "Issue ID: 40045440\nStatus: ASSIGNED\n"
+        "Comment #4 by nicolettep@google.com at 2023-08-14T15:00:00Z:\n"
+        "Assigning to Julia for SkParagraph triage.\n"
+    )
+    # Bug was previously unrendered in state["bugs"] (empty comments_checked_major_mod)
+    state: dict[str, object] = {
+        "items": {},
+        "bugs": {
+            "buganizer:40045440": {
+                "bug_key": "buganizer:40045440",
+                "source": "buganizer",
+                "id": "40045440",
+                "short_id": "crbug/40045440",
+                "title": "Wrong text wrapper behavior",
+                "status": "ASSIGNED",
+                "priority": "P2",
+                "assignee": "jlavrova@google.com",
+                "seen_self_assigned": True,
+                "modified_time": "2026-05-01T00:00:00Z",
+                "last_human_comment_at": "",
+                "comments_checked_major_mod": "",
+            }
+        },
+        "events": [],
+    }
+    chats = {
+        "buganizer:40045440": {
+            "bug_key": "buganizer:40045440",
+            "conversation_id": "cid-40045440",
+            "title": "[12:00] \u29bf crbug/40045440 text wrapper behavior",
+            "project_id": "p-skp",
+            "project_name": "SkParagraph",
+            "chat_created_at": "2026-11-12T16:00:00Z",
+            "chat_last_modified": "2026-11-12T16:10:00Z",
+            "chat_archived": False,
+            "chat_busy": False,
+        }
+    }
+
+    def mcp_fn(calls: list[tuple[str, dict[str, object]]]) -> list[str]:
+      outs: list[str] = []
+      for name, args in calls:
+        if name == "get_bugs_with_external":
+          q = str(args.get("query") or "")
+          outs.append(open_old if "status:open" in q and "-status:open" not in q else "")
+        elif name == "render_issue_with_external":
+          outs.append(rendered_old)
+        else:
+          outs.append("")
+      return outs
+
+    with (
+        mock.patch.object(w.time, "time", return_value=now_ts),
+        mock.patch.object(w, "call_buganizer_mcp_batch", side_effect=mcp_fn),
+        mock.patch.object(w, "fetch_github_bugs", return_value=[]),
+        mock.patch.object(w, "discover_bug_chats", return_value=chats),
+        mock.patch.object(w, "wake_conversation") as wake_mock,
+    ):
+      w.sync_bugs_into_state(
+          state, force=True, wake_chats=True, proj_names={"p-skp": "SkParagraph"}
+      )
+      # Even if state["bugs"] is wiped, persistent bug_comment_watermarks blocks replay
+      state["bugs"] = {}
+      w.sync_bugs_into_state(
+          state, force=True, wake_chats=True, proj_names={"p-skp": "SkParagraph"}
+      )
+
+    wake_mock.assert_not_called()
+    self.assertFalse(state["bugs"]["buganizer:40045440"]["needs_you"])
+
+  # Checks genuine post-watch human comment wakes once, retries RPC failure, and deduplicates
+  def test_new_human_comment_wakes_once_retries_transient_rpc_and_deduplicates(self) -> None:
+    t0 = w._parse_ts("2026-11-12T18:00:00Z")
+    chats = {
+        "buganizer:590000001": {
+            "bug_key": "buganizer:590000001",
+            "conversation_id": "cid-590000001",
+            "title": "[12:50] \u29bf crbug/590000001 ligature caret split",
+            "project_id": "p-skp",
+            "project_name": "SkParagraph",
+            "chat_created_at": "2026-11-12T17:50:00Z",
+            "chat_last_modified": "2026-11-12T18:02:00Z",
+            "chat_archived": False,
+            "chat_busy": False,
+        }
+    }
+    open_v1 = (
+        "Issue ID: 590000001\nComponent ID: 1457031\nAssignee: jlavrova@google.com\n"
+        "Status: ASSIGNED\nPriority: P2\nIssue Type: BUG\nTitle: Ligature caret split\n"
+        "Created Time: 2026-11-12T17:00:00Z\nModified Time: 2026-11-12T17:40:00Z\n"
+        "Major Modified Time: 2026-11-12T17:40:00Z\n"
+    )
+    rendered_v1 = (
+        "Issue ID: 590000001\nStatus: ASSIGNED\n"
+        "Comment #2 by reporter@chromium.org at 2026-11-12T17:40:00Z:\n"
+        "Initial repro steps.\n"
+    )
+    open_v2 = open_v1.replace("2026-11-12T17:40:00Z", "2026-11-12T18:01:00Z")
+    rendered_v2 = (
+        rendered_v1
+        + "\nComment #3 by reviewer@chromium.org at 2026-11-12T18:01:00Z:\n"
+        "Please also check RTL ZWJ clusters.\n"
+    )
+
+    cur_open = open_v1
+    cur_rendered = rendered_v1
+
+    def mcp_fn(calls: list[tuple[str, dict[str, object]]]) -> list[str]:
+      outs: list[str] = []
+      for name, args in calls:
+        if name == "get_bugs_with_external":
+          q = str(args.get("query") or "")
+          outs.append(cur_open if "status:open" in q and "-status:open" not in q else "")
+        elif name == "render_issue_with_external":
+          outs.append(cur_rendered)
+        else:
+          outs.append("")
+      return outs
+
+    state: dict[str, object] = {"items": {}, "bugs": {}, "events": []}
+    with (
+        mock.patch.object(w, "call_buganizer_mcp_batch", side_effect=mcp_fn),
+        mock.patch.object(w, "fetch_github_bugs", return_value=[]),
+        mock.patch.object(w, "discover_bug_chats", return_value=chats),
+        mock.patch.object(w, "_check_profile_quota_hold", return_value=(False, {})),
+    ):
+      # Poll 1: seed baseline cleanly with zero wakeups
+      with (
+          mock.patch.object(w.time, "time", return_value=t0),
+          mock.patch.object(w, "wake_conversation", return_value=True) as wake_p1,
+      ):
+        w.sync_bugs_into_state(
+            state, force=True, wake_chats=True, proj_names={"p-skp": "SkParagraph"}
+        )
+      wake_p1.assert_not_called()
+
+      # Poll 2: Comment #3 arrives after chat_created_at & watch_since_ts; transient RPC fails
+      cur_open = open_v2
+      cur_rendered = rendered_v2
+      with (
+          mock.patch.object(w.time, "time", return_value=t0 + 150.0),
+          mock.patch.object(w, "wake_conversation", return_value=False) as wake_p2,
+      ):
+        w.sync_bugs_into_state(
+            state, force=True, wake_chats=True, proj_names={"p-skp": "SkParagraph"}
+        )
+      wake_p2.assert_called_once()
+
+      # Poll 3: RPC recovers -> Comment #3 wakes chat once and records persistent dedup token
+      with (
+          mock.patch.object(w.time, "time", return_value=t0 + 300.0),
+          mock.patch.object(w, "wake_conversation", return_value=True) as wake_p3,
+      ):
+        w.sync_bugs_into_state(
+            state, force=True, wake_chats=True, proj_names={"p-skp": "SkParagraph"}
+        )
+      wake_p3.assert_called_once()
+      self.assertIn("RTL ZWJ clusters", wake_p3.call_args[0][1])
+
+      # Poll 4: Even if state["bugs"] is wiped, persistent dedup prevents duplicate wakeup
+      disk_copy = json.loads(json.dumps(state))
+      state["bugs"] = {}
+      with mock.patch.object(w, "load_watcher_state", return_value=disk_copy):
+        w.merge_concurrent_state_mutations(state, {"bugs": {}, "items": {}})
+      with (
+          mock.patch.object(w.time, "time", return_value=t0 + 450.0),
+          mock.patch.object(w, "wake_conversation", return_value=True) as wake_p4,
+      ):
+        w.sync_bugs_into_state(
+            state, force=True, wake_chats=True, proj_names={"p-skp": "SkParagraph"}
+        )
+      wake_p4.assert_not_called()
+
+  # Checks GitHub sliding timeline window, same-second replies, and boilerplate filtering
+  def test_github_sliding_window_same_second_replies_and_boilerplate_filter(
+      self,
+  ) -> None:
+    t0 = w._parse_ts("2026-11-12T18:00:00Z")
+    chats = {
+        "gh_issue:flutter/flutter#199001": {
+            "bug_key": "gh_issue:flutter/flutter#199001",
+            "conversation_id": "cid-gh-199001",
+            "title": "[12:50] \u29bf flutter#199001 bidi selection",
+            "project_id": "p-skp",
+            "project_name": "SkParagraph",
+            "chat_created_at": "2026-11-12T17:50:00Z",
+            "chat_last_modified": "2026-11-12T17:55:00Z",
+            "chat_archived": False,
+            "chat_busy": False,
+        }
+    }
+
+    def make_gql_payload(tail_nodes: list[dict[str, object]]) -> str:
+      filler = [
+          {"__typename": "LabeledEvent", "createdAt": "2026-11-12T17:00:00Z"}
+          for _ in range(50 - len(tail_nodes))
+      ]
+      return json.dumps({
+          "data": {
+              "repository": {
+                  "issue": {
+                      "number": 199001,
+                      "title": "BiDi selection regression",
+                      "state": "OPEN",
+                      "url": "https://github.com/flutter/flutter/issues/199001",
+                      "createdAt": "2026-11-12T16:00:00Z",
+                      "updatedAt": "2026-11-12T18:10:00Z",
+                      "body": "Initial issue report @Rusino",
+                      "author": {"login": "reporter"},
+                      "assignees": {"nodes": []},
+                      "timelineItems": {"nodes": filler + tail_nodes},
+                  }
+              }
+          }
+      })
+
+    # Migration boilerplate in mention timeline must not count as a newer human comment
+    mig_payload = make_gql_payload([
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "Rusino"},
+            "createdAt": "2026-11-12T17:30:00Z",
+            "updatedAt": "2026-11-12T17:30:00Z",
+            "body": "Investigating this.",
+        },
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "colleague"},
+            "createdAt": "2026-11-12T17:40:00Z",
+            "updatedAt": "2026-11-12T17:40:00Z",
+            "body": "[Empty comment from Monorail migration]",
+        },
+    ])
+    with mock.patch.object(w.subprocess, "check_output", return_value=mig_payload):
+      self.assertIsNone(
+          w._evaluate_github_mention_issue("flutter/flutter", "199001", {"rusino"})
+      )
+
+    # Poll 1: seed baseline at nodes[49] before watch window
+    p1_payload = make_gql_payload([
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "Rusino"},
+            "createdAt": "2026-11-12T17:30:00Z",
+            "updatedAt": "2026-11-12T17:30:00Z",
+            "body": "Uploaded fix PR.",
+        },
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "init_user"},
+            "createdAt": "2026-11-12T17:40:00Z",
+            "updatedAt": "2026-11-12T17:40:00Z",
+            "body": "Pre-chat note.",
+        },
+    ])
+    # Poll 2: alice comments at nodes[49] at 18:01:00Z
+    p2_payload = make_gql_payload([
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "Rusino"},
+            "createdAt": "2026-11-12T17:30:00Z",
+            "updatedAt": "2026-11-12T17:30:00Z",
+            "body": "Uploaded fix PR.",
+        },
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "alice"},
+            "createdAt": "2026-11-12T18:01:00Z",
+            "updatedAt": "2026-11-12T18:01:00Z",
+            "body": "Alice follow-up question.",
+        },
+    ])
+    # Poll 3: window slides by 1 so bob is now at nodes[49] at 18:05:00Z
+    p3_payload = make_gql_payload([
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "alice"},
+            "createdAt": "2026-11-12T18:01:00Z",
+            "updatedAt": "2026-11-12T18:01:00Z",
+            "body": "Alice follow-up question.",
+        },
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "bob"},
+            "createdAt": "2026-11-12T18:05:00Z",
+            "updatedAt": "2026-11-12T18:05:00Z",
+            "body": "Bob new repro case.",
+        },
+    ])
+    # Poll 4: carol comments in the exact same integer second 18:05:00Z at nodes[49]
+    p4_payload = make_gql_payload([
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "bob"},
+            "createdAt": "2026-11-12T18:05:00Z",
+            "updatedAt": "2026-11-12T18:05:00Z",
+            "body": "Bob new repro case.",
+        },
+        {
+            "__typename": "IssueComment",
+            "author": {"login": "carol"},
+            "createdAt": "2026-11-12T18:05:00Z",
+            "updatedAt": "2026-11-12T18:05:00Z",
+            "body": "Carol same-second observation.",
+        },
+    ])
+
+    state: dict[str, object] = {"items": {}, "bugs": {}, "events": []}
+    woken_msgs: list[str] = []
+    for step, gql_out in enumerate((p1_payload, p2_payload, p3_payload, p4_payload)):
+      with mock.patch.object(w.subprocess, "check_output", return_value=gql_out):
+        gh_bug = w._evaluate_github_mention_issue(
+            "flutter/flutter", "199001", {"rusino"}
+        )
+      self.assertIsNotNone(gh_bug)
+      assert isinstance(gh_bug, dict)
+      self.assertEqual(gh_bug["last_human_comment_num"], 0)
+      with (
+          mock.patch.object(w.time, "time", return_value=t0 + step * 180.0),
+          mock.patch.object(w, "call_buganizer_mcp_batch", return_value=["No issues found", ""]),
+          mock.patch.object(w, "fetch_github_bugs", return_value=[gh_bug]),
+          mock.patch.object(w, "discover_bug_chats", return_value=chats),
+          mock.patch.object(w, "_check_profile_quota_hold", return_value=(False, {})),
+          mock.patch.object(
+              w,
+              "wake_conversation",
+              side_effect=lambda _cid, msg, **_kw: (woken_msgs.append(msg) or True),
+          ),
+      ):
+        w.sync_bugs_into_state(
+            state, force=True, wake_chats=True, proj_names={"p-skp": "SkParagraph"}
+        )
+
+    self.assertEqual(len(woken_msgs), 3)
+    self.assertIn("Alice follow-up question.", woken_msgs[0])
+    self.assertIn("Bob new repro case.", woken_msgs[1])
+    self.assertIn("Carol same-second observation.", woken_msgs[2])
+
+  # Checks pre-R96 cached bug without chat_created_at never backdates watch_since_ts to 2020
+  def test_pre_r96_cached_bug_without_chat_created_at_never_backdates_watch_since_ts(
+      self,
+  ) -> None:
+    now_ts = w._parse_ts("2026-11-12T18:00:00Z")
+    open_block = (
+        "Issue ID: 41236341\nComponent ID: 1457031\nAssignee: jlavrova@google.com\n"
+        "Status: ASSIGNED\nPriority: P2\nIssue Type: BUG\nTitle: Paint order text outline\n"
+        "Created Time: 2016-01-20T00:00:00Z\nModified Time: 2026-11-12T17:00:00Z\n"
+        "Major Modified Time: 2026-04-30T12:00:09.282Z\n"
+    )
+    rendered_block = (
+        "Issue ID: 41236341\nStatus: ASSIGNED\n"
+        "Comment #14 by rmistry@google.com at 2022-05-01T12:00:00Z:\n"
+        "Genuine human comment from 2022 before migration comment #15.\n\n"
+        "Comment #15 by issuetracker-automation@google.com at 2020-10-20T21:01:58Z:\n"
+        "This issue was migrated from crbug.com/chromium/580768?no_tracker_redirect=1\n"
+    )
+    state: dict[str, object] = {
+        "items": {
+            "gerrit:1414001@cid-cl-shared": {
+                "item_key": "gerrit:1414001",
+                "kind": "gerrit",
+                "target_id": "1414001",
+                "subject": "WIP fix for crbug/41236341",
+                "commit_message": "Bug: 41236341",
+                "status": "NEW",
+                "is_self": True,
+                "is_wip": True,
+                "conversation_id": "cid-cl-shared",
+                "chat_archived": False,
+                "project_id": "p-skia",
+                "project_name": "Skia",
+            }
+        },
+        "bugs": {
+            "buganizer:41236341": {
+                "bug_key": "buganizer:41236341",
+                "source": "buganizer",
+                "id": "41236341",
+                "short_id": "crbug/41236341",
+                "title": "Paint order text outline",
+                "status": "ASSIGNED",
+                "priority": "P2",
+                "assignee": "jlavrova@google.com",
+                "seen_self_assigned": True,
+                "modified_time": "2026-05-26T16:04:35.352Z",
+                "major_modified_time": "2026-04-30T12:00:09.282Z",
+                "conversation_id": "cid-cl-shared",
+                "chat_archived": False,
+                "last_human_comment_author": "issuetracker-automation@google.com",
+                "last_human_comment_at": "2020-10-20T21:01:58Z",
+                "comments_checked_major_mod": (
+                    "v3:2026-05-26T16:04:35.352Z|2026-04-30T12:00:09.282Z"
+                ),
+            }
+        },
+        "events": [],
+    }
+
+    def mcp_fn(calls: list[tuple[str, dict[str, object]]]) -> list[str]:
+      outs: list[str] = []
+      for name, args in calls:
+        if name == "get_bugs_with_external":
+          q = str(args.get("query") or "")
+          outs.append(open_block if "status:open" in q and "-status:open" not in q else "")
+        elif name == "render_issue_with_external":
+          outs.append(rendered_block)
+        else:
+          outs.append("")
+      return outs
+
+    with (
+        mock.patch.object(w.time, "time", return_value=now_ts),
+        mock.patch.object(w, "call_buganizer_mcp_batch", side_effect=mcp_fn),
+        mock.patch.object(w, "fetch_github_bugs", return_value=[]),
+        mock.patch.object(w, "discover_bug_chats", return_value={}),
+        mock.patch.object(w, "wake_conversation") as wake_mock,
+    ):
+      w.sync_bugs_into_state(state, force=True, wake_chats=True, proj_names={"p-skia": "Skia"})
+
+    wake_mock.assert_not_called()
+    wm = state["bug_comment_watermarks"]["buganizer:41236341"]
+    self.assertGreaterEqual(float(wm["watch_since_ts"]), now_ts)
+    self.assertGreaterEqual(float(wm["chat_watch_since_ts"]), now_ts)
+
+  # Checks 1:1 self-CL chat propagation updates chat_created_at and clears archived timestamps
+  def test_self_cl_1to1_chat_updates_chat_created_at_and_suppresses_stale_needs_you(
+      self,
+  ) -> None:
+    now_ts = w._parse_ts("2026-11-12T19:00:00Z")
+    bugs: dict[str, dict[str, object]] = {
+        "buganizer:41239999": {
+            "bug_key": "buganizer:41239999",
+            "source": "buganizer",
+            "id": "41239999",
+            "short_id": "crbug/41239999",
+            "title": "Hyphenation fallback crash",
+            "status": "ASSIGNED",
+            "priority": "P2",
+            "assignee": "jlavrova@google.com",
+            "conversation_id": "cid-old-archived",
+            "chat_archived": True,
+            "chat_created_at": "2026-10-01T00:00:00Z",
+            "last_human_comment_author": "reviewer@chromium.org",
+            "last_human_comment_at": "2026-10-15T12:00:00Z",
+            "last_human_comment_snippet": "Still reproduces on M132.",
+            "gerrit_cl_ids": ["1419999"],
+        }
+    }
+    items: dict[str, dict[str, object]] = {
+        "gerrit:1419999@cid-new-cl": {
+            "item_key": "gerrit:1419999",
+            "kind": "gerrit",
+            "target_id": "1419999",
+            "subject": "WIP fix for crbug/41239999",
+            "commit_message": "Bug: 41239999",
+            "status": "NEW",
+            "is_self": True,
+            "is_wip": True,
+            "conversation_id": "cid-new-cl",
+            "chat_archived": False,
+            "chat_created_at": "2026-11-12T18:00:00Z",
+            "project_id": "p-skia",
+            "project_name": "Skia",
+        }
+    }
+    w.link_bugs_and_cls(bugs, items, bug_chats=None)
+    bug = bugs["buganizer:41239999"]
+    w.classify_bug_status(bug, now_ts=now_ts)
+    self.assertEqual(bug["conversation_id"], "cid-new-cl")
+    self.assertEqual(bug["chat_created_at"], "2026-11-12T18:00:00Z")
+    self.assertFalse(bug["needs_you"])
+    self.assertEqual(bug["lane"], "has_cl")
+
+    # _start_chat_for_bug reusing a 1:1 self-CL chat must also refresh chat_created_at
+    bug["conversation_id"] = ""
+    bug["chat_archived"] = True
+    bug["chat_created_at"] = "2026-10-01T00:00:00Z"
+    state_for_start: dict[str, object] = {"bugs": bugs, "items": items}
+    with mock.patch.object(w, "discover_bug_chats", return_value={}):
+      res = w._start_chat_for_bug(state_for_start, "buganizer:41239999", save=False)
+    self.assertTrue(res["ok"])
+    self.assertEqual(bug["conversation_id"], "cid-new-cl")
+    self.assertFalse(bug["chat_archived"])
+    self.assertEqual(bug["chat_created_at"], "2026-11-12T18:00:00Z")
+
 
 if __name__ == "__main__":
   unittest.main()
- 
+
