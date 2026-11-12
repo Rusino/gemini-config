@@ -1681,9 +1681,10 @@ def update_conv_dossier_summary(conv_id: str, transcript_path: str = "") -> bool
   try:
     import chat_lifecycle
 
+    # Gemini <= 3.1 is banned; M198 is gemini-3.5-flash-lite in the live catalog
     rpc_res = chat_lifecycle.ls_rpc(
         "GetModelResponse",
-        {"prompt": prompt, "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH"},
+        {"prompt": prompt, "model": "MODEL_PLACEHOLDER_M198"},
         timeout=15.0,
     )
     tldr_text = (rpc_res.get("response") or "").strip()

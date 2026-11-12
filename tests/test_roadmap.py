@@ -939,6 +939,27 @@ class TestRoadmap(unittest.TestCase):
           sys.modules["unittest"] = unittest
       self.assertEqual([c["cl_id"] for c in priv_open], ["1422496"])
 
+  # Out-of-band TL;DR must call GetModelResponse on a non-legacy (> Gemini 3.1) model enum
+  def test_dossier_summary_never_uses_legacy_model(self):
+    import chat_lifecycle
+
+    tpath = os.path.join(self.tmp.name, "transcript.jsonl")
+    with open(tpath, "w", encoding="utf-8") as f:
+      f.write(json.dumps({"type": "USER_INPUT", "content": "fix the bug"}) + "\n")
+    bodies = []
+
+    def fake_rpc(method, body, timeout=0.0):
+      bodies.append((method, body))
+      raise RuntimeError("offline in test")
+
+    with patch.object(roadmap, "project_id_for", return_value=""), \
+         patch.object(chat_lifecycle, "ls_rpc", side_effect=fake_rpc):
+      self.assertFalse(roadmap.update_conv_dossier_summary("conv-tldr", tpath))
+    self.assertEqual([m for m, _ in bodies], ["GetModelResponse"])
+    enum = bodies[0][1]["model"]
+    self.assertFalse(chat_lifecycle.is_legacy_model(enum=enum), enum)
+    self.assertEqual(enum, "MODEL_PLACEHOLDER_M198")
+
 
 if __name__ == "__main__":
   unittest.main()

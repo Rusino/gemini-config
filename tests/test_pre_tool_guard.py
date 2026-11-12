@@ -153,7 +153,8 @@ class TestPreToolGuard(unittest.TestCase):
         rewritten = out["overwrite"]["CommandLine"]
         self.assertIn("env -u ANTIGRAVITY_SOURCE_METADATA", rewritten)
         self.assertIn("--title=", rewritten)
-        self.assertIn("--model=pro", rewritten)
+        self.assertIn("--model=gemini-4-carbon-high", rewritten)
+        self.assertNotIn("--model=pro", rewritten)
 
   def test_agentapi_send_message_rewrite(self):
     cmd = 'agentapi send-message c1 "hello"'
@@ -2390,6 +2391,49 @@ class TestPreToolGuard(unittest.TestCase):
         ),
         "",
     )
+
+  # agentapi `pro` tier and Gemini <= 3.1 ids must be denied with an allowed suggestion
+  def test_legacy_model_denial_blocks_agentapi_pro_and_legacy_ids(self):
+    deny = pre_tool_guard.legacy_model_launch_denial
+    for cmd in ('agentapi new-conversation --model=pro "go"',
+                'agentapi new-conversation --model pro "go"',
+                'env -u X agentapi new-conversation --model=gemini-3.1-pro-high "go"',
+                '/bin/agentapi new-conversation --model="gemini-2.5-flash" "go"'):
+      reason = deny("run_command", {"CommandLine": cmd})
+      self.assertIn("[LEGACY-MODEL GUARD]", reason, cmd)
+      self.assertIn("gemini-4-carbon-high", reason, cmd)
+    for cmd in ('agentapi new-conversation --model=flash "go"',
+                'agentapi new-conversation --model=gemini-4-carbon-high "go"',
+                'grep "agentapi new-conversation --model=pro" notes.md'):
+      self.assertEqual(deny("run_command", {"CommandLine": cmd}), "", cmd)
+
+  # Subagent and swarm workers must never be pinned to a Gemini <= 3.1 model
+  def test_legacy_model_denial_blocks_subagent_and_swarm_models(self):
+    deny = pre_tool_guard.legacy_model_launch_denial
+    self.assertIn("[LEGACY-MODEL GUARD]", deny("invoke_subagent", {"Model": "gemini-3.1-pro"}))
+    self.assertIn(
+        "Gemini 3.1 Pro", deny("swarm", {"action": "add", "model": "Gemini 3.1 Pro (Low)"})
+    )
+    self.assertIn("[LEGACY-MODEL GUARD]", deny("swarm", {"action": "model", "model": "pro"}))
+    self.assertEqual(deny("swarm", {"action": "add", "model": "gemini-4-carbon-high"}), "")
+    self.assertEqual(deny("invoke_subagent", {"Model": "flash"}), "")
+    self.assertEqual(deny("swarm", {"action": "status"}), "")
+
+  # main() must deny a legacy agentapi launch even outside a pending handoff
+  def test_main_denies_agentapi_pro_launch(self):
+    data = {
+        "conversationId": "c1",
+        "toolCall": {
+            "name": "run_command",
+            "args": {"CommandLine": 'agentapi new-conversation --model=pro "go"'},
+        },
+    }
+    with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+         patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+      pre_tool_guard.main()
+    out = json.loads(mock_out.getvalue())
+    self.assertEqual(out.get("decision"), "deny")
+    self.assertIn("[LEGACY-MODEL GUARD]", out.get("reason", ""))
 
 
 if __name__ == "__main__":

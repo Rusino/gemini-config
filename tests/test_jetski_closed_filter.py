@@ -1249,7 +1249,7 @@ const liveBucketBtn = (k) =>
   });
   assert(genTldr.includes('Задача: Тест'), 'Generated TL;DR must return response text');
   assert.strictEqual(rpcRequests.length, 1);
-  assert.strictEqual(rpcRequests[0].body.model, 'MODEL_GOOGLE_GEMINI_2_5_FLASH');
+  assert.strictEqual(rpcRequests[0].body.model, 'MODEL_PLACEHOLDER_M198');
   assert(typeof rpcRequests[0].body.prompt === 'string', 'RPC prompt must be a string');
 
   // The titlebar Archive button on a chain tail archives only that chat: no chain walk, no
@@ -3041,6 +3041,8 @@ displayOptionsBtn.setAttribute('aria-label', 'Display Options');
 actionRow.appendChild(displayOptionsBtn);
 bodyEl.appendChild(actionRow);
 
+// Pin the browser-local zone so quota reset clocks render deterministically (EDT, UTC-4)
+process.env.TZ = 'America/New_York';
 // Freeze clock before fixture evaluation to prevent resetTime expiration
 const NOW_ISO = '2026-10-29T18:30:00Z';
 Date.now = () => Date.parse(NOW_ISO);
@@ -3091,6 +3093,9 @@ function makeServerUserStatus(proRemaining = 0.989) {
     makeNativeConfig('Gemini 3.5 Flash Lite', 1198, 'gemini-3.5-flash-lite', 0.998),
     makeNativeConfig('Claude Opus 5.5 (Max)', 1371, 'opus-5.5-max', 0.56),
     makeNativeConfig('Claude Opus 5.5 (High)', 1370, 'opus-5.5-high', 0.56),
+    makeNativeConfig('Gemini 3.1 Pro (High)', 1037, 'gemini-3.1-pro-high', 0.99),
+    // Live catalogs alias legacy ids under an allowed label; dropping it must keep 1198
+    makeNativeConfig('Gemini 3.5 Flash Lite', 1050, 'gemini-3.1-flash-lite', 0.97),
   ];
   return protoObj('exa.codeium_common_pb.UserStatus', {
     cascadeModelConfigData: protoObj('exa.codeium_common_pb.CascadeModelConfigData', {
@@ -3101,7 +3106,7 @@ function makeServerUserStatus(proRemaining = 0.989) {
           groups: [
             protoObj('exa.codeium_common_pb.ClientModelGroup', {
               groupName: '',
-              modelLabels: nativeConfigs.map((c) => c.label),
+              modelLabels: [...new Set(nativeConfigs.map((c) => c.label))],
             }),
           ],
         }),
@@ -3214,6 +3219,34 @@ const availableModelsPayload = {
         apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
         supportsImages: true,
         quotaInfo: { remainingFraction: 0.998, resetTime: '2026-10-30T14:00:00Z' },
+      },
+      'gemini-3.1-pro-high': {
+        displayName: 'Gemini 3.1 Pro (High)',
+        model: 'MODEL_PLACEHOLDER_M37',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.99, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'gemini-3.1-flash-lite': {
+        displayName: 'Gemini 3.5 Flash Lite',
+        model: 'MODEL_PLACEHOLDER_M50',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 1, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'gemini-3.8-flash-medium': {
+        displayName: 'Gemini 3.8 Flash (Medium)',
+        model: 'MODEL_PLACEHOLDER_M319',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.12, resetTime: '2026-10-29T21:02:00Z' },
+      },
+      'gemini-3.8-flash-high': {
+        displayName: 'Gemini 3.8 Flash (High)',
+        model: 'MODEL_PLACEHOLDER_M318',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.2, resetTime: '2026-10-30T12:30:00Z' },
       },
       'deepseek-r2-bon-arm': {
         displayName: 'Gemini Pro Next',
@@ -3447,11 +3480,32 @@ global.requestAnimationFrame = () => 1;
   assert.strictEqual(byModelId.get('gemini-3.8-flash-router')?.label, 'Gemini 3.8 Flash Router');
   assert.strictEqual(byModelId.get('gemini-3.8-flash-router')?.tagTitle, 'Exp · 88%');
 
-  const flash25 = byModelId.get('gemini-2.5-flash');
-  assert(flash25, 'Gemini 2.5 Flash must be unlocked with named enum 312');
-  assert.strictEqual(flash25.label, 'Gemini 2.5 Flash');
-  assert.strictEqual(flash25.tagTitle, '2.5 · 100%');
-  assert.deepStrictEqual(flash25.modelOrAlias.choice, { case: 'model', value: 312 });
+  // Gemini <= 3.1 is never offered, whether the server sends it natively or as a hidden model;
+  // live catalogs alias legacy ids to newer display names, so ids and enums decide
+  for (const legacy of ['gemini-2.5-flash', 'gemini-3.1-pro-high', 'gemini-3.1-flash-lite']) {
+    assert(!byModelId.has(legacy), `Legacy model ${legacy} must not appear in picker`);
+  }
+  assert(!labels.includes('Gemini 3.1 Pro (High)'), 'Native legacy label must leave the sort');
+  assert(!configs.some((c) => c.modelOrAlias?.choice?.value === 1037));
+  assert(!configs.some((c) => c.modelOrAlias?.choice?.value === 1050));
+  assert(
+    configs.some((c) => c.modelOrAlias?.choice?.value === 1198),
+    'Allowed model sharing a label with a dropped legacy alias must stay in the picker'
+  );
+  assert(labels.includes('Gemini 3.5 Flash Lite'), 'Shared label must stay in the sort');
+
+  // Below the 30% soft floor the pill shows the local reset clock, with a weekday only when the
+  // reset falls on another local day; above it only the tooltip names the reset clock
+  const lowFlash = byModelId.get('gemini-3.8-flash-medium');
+  assert(/(?:^| · )12% ↻17:02$/.test(lowFlash?.tagTitle || ''), `got: ${lowFlash?.tagTitle}`);
+  assert(lowFlash.tagDescription.includes('resets 17:02'), lowFlash.tagDescription);
+  const lowFlashHigh = byModelId.get('gemini-3.8-flash-high');
+  assert(
+    /(?:^| · )20% ↻Fri 08:30$/.test(lowFlashHigh?.tagTitle || ''),
+    `got: ${lowFlashHigh?.tagTitle}`
+  );
+  assert(opusMed.tagDescription.includes('resets Fri 08:30'), opusMed.tagDescription);
+  assert(!opusMed.tagDescription.includes('resets in'), opusMed.tagDescription);
 
   const future = byModelId.get('deepseek-r2-preview');
   assert(future, 'Unknown future hidden model must be unlocked via fallback');
@@ -3543,7 +3597,7 @@ global.requestAnimationFrame = () => 1;
   ]);
 
   // Verify OneQuota tag is preserved as-is
-  const oqConfig = makeNativeConfig('Gemini 3.1 Pro', 1333, 'gemini-3.1-pro', 0);
+  const oqConfig = makeNativeConfig('Gemini Pro Next', 1260, 'auto', 0);
   oqConfig.tagTitle = 'OneQuota';
   oqConfig.tagDescription = 'Managed outside AICode quota';
   const oqStatus = protoObj('exa.codeium_common_pb.UserStatus', {
@@ -6814,9 +6868,9 @@ global.clearTimeout = (id) => {
   // 1. Protobuf3 omitted remainingFraction quota verification
   const argon = byModelId.get('gemini-launch-candidate');
   assert(argon, 'Argon must be present in configs');
-  assert.strictEqual(
-    argon.tagTitle,
-    '0%',
+  // Exhausted models sit below the soft floor, so the pill also names the local reset clock
+  assert(
+    /^0% ↻(?:[A-Z][a-z]{2} )?\d{2}:\d{2}$/.test(argon.tagTitle),
     `Argon with omitted remainingFraction and future resetTime must show 0%, got: ${argon.tagTitle}`
   );
   assert.strictEqual(argon.quotaInfo.remainingFraction, 0);
@@ -6850,11 +6904,12 @@ global.clearTimeout = (id) => {
   reduxStore.dispatch({ type: 'NOOP' });
   await new Promise((r) => setImmediate(r));
 
-  // In triage, Gemini 2.5 Flash (312 at 99.8%) must be picked over Gemini 3.8 Flash (50%)
+  // In triage, banned Gemini 2.5 Flash (312 at 99.8%) loses to Gemini 3.8 Flash High (1320)
   assert.strictEqual(
     storeState.modelSelection.default.model,
-    312,
-    `triage draft must auto-select Gemini 2.5 Flash (312), got: ${storeState.modelSelection.default.model}`
+    1320,
+    `triage draft must auto-select Gemini 3.8 Flash (1320), got: ${
+      storeState.modelSelection.default.model}`
   );
 
   // 4. Existing conversation mid-chat failover: trajectoryModelObserved with exhausted model
@@ -7106,7 +7161,7 @@ global.clearTimeout = (id) => {
   await new Promise((r) => setImmediate(r));
   assert.strictEqual(
     storeState.modelSelection.default.model,
-    312,
+    1320,
     'Draft manual pick in one project must not block autopilot in another project'
   );
 
@@ -11975,6 +12030,24 @@ async function refreshCatalogInStore() {
       window.__jetskiManualPickedModels.get('chat-unpinned-cpp')?.model,
       1370,
       'Manual user pick of Opus High (1370) at 0% quota must stay persisted in manual pins'
+    );
+
+    // A mistaken manual pick of Gemini 3.1 Pro (1037) is never honored or pinned, unlike
+    // senior picks above: the chat is rescued to its profile model instead
+    reduxStore.dispatch({
+      type: 'modelSelection/modelPicked',
+      payload: { conversationId: 'chat-unpinned-cpp', model: 1037 },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.notStrictEqual(
+      storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
+      1037,
+      'Manual pick of legacy Gemini 3.1 Pro (1037) must be rescued'
+    );
+    assert.notStrictEqual(
+      window.__jetskiManualPickedModels.get('chat-unpinned-cpp')?.model,
+      1037,
+      'Legacy Gemini 3.1 Pro (1037) must never be stored as a manual pin'
     );
 
     process.stdout.write('MORNING_MODEL_RESET_PASSED\n');

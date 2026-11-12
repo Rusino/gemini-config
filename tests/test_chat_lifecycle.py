@@ -3586,6 +3586,106 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertTrue(chat_lifecycle.is_archived("sib-wip"))
 
 
+class TestLegacyModelBan(unittest.TestCase):
+  """Models <= Gemini 3.1 must never be selected or launched by chat_lifecycle."""
+
+  LEGACY_CATALOG = {
+      # Live catalog aliases legacy ids under a newer display name
+      "gemini-2.5-flash": {
+          "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH",
+          "displayName": "Gemini 3.5 Flash Lite",
+      },
+      "gemini-3.1-pro-high": {"model": "MODEL_PLACEHOLDER_M37", "displayName": "Gemini 3.1 Pro"},
+      "gemini-3.1-flash-lite": {
+          "model": "MODEL_PLACEHOLDER_M50",
+          "displayName": "Gemini 3.5 Flash Lite",
+      },
+      "gemini-3.5-flash-lite": {
+          "model": "MODEL_PLACEHOLDER_M198",
+          "displayName": "Gemini 3.5 Flash Lite",
+      },
+      "gemini-4-carbon-high": {
+          "model": "MODEL_PLACEHOLDER_M427",
+          "displayName": "Gemini 4 Carbon (High)",
+      },
+  }
+
+  # Ids, enums and labels up to 3.1 are legacy; 3.5+, Gemini 4 and the image model are not
+  def test_is_legacy_model_flags_gemini_up_to_3_1(self):
+    legacy = chat_lifecycle.is_legacy_model
+    for mid in ("gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.1-pro-low", "gemini-3.0-pro",
+                "gemini-3.1-flash-lite", "gemini-2.5-flash-thinking"):
+      self.assertTrue(legacy(model_id=mid), mid)
+    for enum in ("MODEL_PLACEHOLDER_M37", "MODEL_PLACEHOLDER_M50", "MODEL_PLACEHOLDER_M333",
+                 "MODEL_PLACEHOLDER_M312", "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE",
+                 "MODEL_GOOGLE_GEMINI_FOR_GOOGLE_2_5_PRO"):
+      self.assertTrue(legacy(enum=enum), enum)
+    for label in ("Gemini 3.1 Pro (Low)", "Gemini 2.5 Flash", "Gemini 3.0 Pro"):
+      self.assertTrue(legacy(label=label), label)
+    for mid in ("gemini-3.5-flash-lite", "gemini-3.8-flash-high", "gemini-4-carbon-high",
+                "gemini-3.10-pro", "gemini-3.1-flash-image", "flash", ""):
+      self.assertFalse(legacy(model_id=mid), mid)
+    self.assertFalse(legacy(enum="MODEL_PLACEHOLDER_M21", label="Gemini 3.1 Flash Image"))
+    self.assertFalse(legacy(enum="MODEL_PLACEHOLDER_M198", label="Gemini 3.5 Flash Lite"))
+
+  # A shared display name must resolve to the non-legacy entry, never to a legacy alias
+  def test_lookup_model_skips_legacy_entries(self):
+    cat = self.LEGACY_CATALOG
+    self.assertEqual(
+        chat_lifecycle.lookup_model(cat, "Gemini 3.5 Flash Lite")["id"], "gemini-3.5-flash-lite"
+    )
+    for wanted in ("gemini-3.1-pro-high", "MODEL_PLACEHOLDER_M50", "gemini-2.5-flash",
+                   "Gemini 3.1 Pro"):
+      self.assertEqual(chat_lifecycle.lookup_model(cat, wanted), {}, wanted)
+
+  # Fallback chains are the last line of defence when the catalog lacks a preferred model
+  def test_model_profiles_have_no_legacy_models_and_triage_keeps_flash(self):
+    for name, chain in chat_lifecycle.MODEL_PROFILES.items():
+      for mid in chain:
+        self.assertFalse(chat_lifecycle.is_legacy_model(model_id=mid), f"{name}: {mid}")
+    self.assertTrue(any("flash" in m for m in chat_lifecycle.MODEL_PROFILES["triage"]))
+
+  # Explicit or inherited legacy models fall back to a profile default instead of launching
+  def test_resolve_handoff_model_rejects_legacy_explicit_and_inherited(self):
+    catalog = {"models": self.LEGACY_CATALOG, "tieredModelIds": {}}
+    with (
+        patch.object(chat_lifecycle, "get_available_models", return_value=catalog),
+        patch.object(chat_lifecycle, "get_project_model_preference", return_value=""),
+        patch.object(chat_lifecycle, "get_conversation_sidecar_id", return_value=""),
+        patch.object(chat_lifecycle, "get_conversation_project_id", return_value=""),
+        patch.object(chat_lifecycle, "read_handoff_model_override", return_value=""),
+        patch.object(chat_lifecycle, "get_last_used_model", return_value="MODEL_PLACEHOLDER_M37"),
+    ):
+      res_exp = chat_lifecycle.resolve_handoff_model("", explicit="gemini-3.1-pro-high")
+      self.assertEqual(res_exp["enum"], "MODEL_PLACEHOLDER_M427")
+      res_inh = chat_lifecycle.resolve_handoff_model("cid-legacy")
+      self.assertEqual(res_inh["enum"], "MODEL_PLACEHOLDER_M427")
+
+  # agentapi tier `pro` is Gemini 3.1 Pro (Low), so it maps to a named non-legacy model
+  def test_agentapi_model_arg_replaces_pro_and_legacy(self):
+    arg = chat_lifecycle.agentapi_model_arg
+    self.assertEqual(arg("pro"), chat_lifecycle.AGENTAPI_SAFE_PRO_MODEL)
+    self.assertEqual(arg("gemini-2.5-flash"), chat_lifecycle.AGENTAPI_SAFE_PRO_MODEL)
+    self.assertEqual(arg("flash"), "flash")
+    self.assertEqual(arg("gemini-3.8-flash-high"), "gemini-3.8-flash-high")
+    self.assertFalse(chat_lifecycle.is_legacy_model(chat_lifecycle.AGENTAPI_SAFE_PRO_MODEL))
+
+  # The offline agentapi fallback of a handoff must not pass `--model=pro`
+  def test_handoff_agentapi_fallback_never_passes_legacy_model(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ctx, launched = TestChatLifecycle._outside_project_handoff_env(self, tmp_dir)
+      with ctx:
+        chat_lifecycle.create_handoff("parent-1", next_step_prompt="go", ignore_live=True)
+      self.assertEqual(len(launched), 1)
+      models = [a for a in launched[0] if a.startswith("--model=")]
+      self.assertEqual(models, [f"--model={chat_lifecycle.AGENTAPI_SAFE_PRO_MODEL}"])
+
+  # USAGE must not advertise the legacy agentapi `pro` tier as the default launch model
+  def test_usage_does_not_recommend_legacy_pro_tier(self):
+    self.assertNotIn('agentapi tier "pro"', chat_lifecycle.USAGE)
+    self.assertNotIn("Gemini 3.1 Pro", chat_lifecycle.USAGE)
+
+
 if __name__ == "__main__":
   unittest.main()
 

@@ -2923,6 +2923,57 @@ def subagent_step_budget_denial(
   )
 
 
+def legacy_model_launch_denial(tool_name: str, tool_args: dict) -> str:
+  """Denies agentapi / invoke_subagent / swarm calls pinned to a Gemini <= 3.1 model.
+
+  agentapi `--model=pro` counts as legacy (tier `pro` is Gemini 3.1 Pro (Low)); quoted
+  mentions (grep/echo) are ignored because only real agentapi invocations are parsed.
+  """
+  if not isinstance(tool_args, dict):
+    return ""
+  models: list[str] = []
+  if tool_name == "run_command":
+    cmd = strip_heredocs(str(tool_args.get("CommandLine") or ""))
+    try:
+      tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+      tokens = cmd.split()
+    for i, tok in enumerate(tokens):
+      if _clean_cmd_token(tok) != "agentapi":
+        continue
+      # Scan this agentapi call's flags up to the next shell separator
+      for j in range(i + 1, len(tokens)):
+        t = tokens[j]
+        if t in (";", "&&", "||", "|"):
+          break
+        if t == "--model" and j + 1 < len(tokens):
+          models.append(tokens[j + 1])
+        elif t.startswith("--model="):
+          models.append(t.split("=", 1)[1])
+  elif tool_name == "invoke_subagent":
+    models.append(_unquote_arg_str(tool_args.get("Model")))
+  elif tool_name == "swarm" and _unquote_arg_str(tool_args.get("action")) in ("add", "model"):
+    models.append(_unquote_arg_str(tool_args.get("model")))
+  models = [m for m in models if m]
+  if not models:
+    return ""
+  hooks_dir = os.path.dirname(os.path.abspath(__file__))
+  if hooks_dir not in sys.path:
+    sys.path.insert(0, hooks_dir)
+  from chat_lifecycle import AGENTAPI_SAFE_PRO_MODEL, is_legacy_model
+
+  for m in models:
+    # invoke_subagent `pro` is already denied by the subagent-model guard with its own advice
+    is_agentapi_pro = m.lower() == "pro" and tool_name != "invoke_subagent"
+    if is_agentapi_pro or is_legacy_model(m, m, m):
+      return (
+          f"[LEGACY-MODEL GUARD] `{m}` is Gemini <= 3.1 (agentapi tier `pro` = Gemini 3.1 "
+          f"Pro (Low)) and is banned. Use `{AGENTAPI_SAFE_PRO_MODEL}` (or `flash` / "
+          "`gemini-3.8-flash-high` for cheap work) instead."
+      )
+  return ""
+
+
 def subagent_model_routing_denial(tool_args: dict) -> str:
   """Blocks Model='pro' and enforces explicit Model='flash' on lookup/skeptic/runner subagents."""
   if not isinstance(tool_args, dict):
@@ -5730,6 +5781,12 @@ def main() -> None:
 
   conv_id = data.get("conversationId", "")
   transcript_path = data.get("transcriptPath", "")
+  # Gemini <= 3.1 bans run before the handoff rewrites that could otherwise pass them along
+  if tool_name in ("run_command", "invoke_subagent", "swarm"):
+    legacy_denial = legacy_model_launch_denial(tool_name, tool_args)
+    if legacy_denial:
+      print(json.dumps({"decision": "deny", "reason": legacy_denial}, ensure_ascii=False))
+      return
   # Block unconfirmed Google Chat MCP writes before running tool calls
   if tool_name == "call_mcp_tool":
     mcp_server = (tool_args.get("ServerName") or "").strip()
@@ -6095,7 +6152,7 @@ def main() -> None:
                       "decision": "deny",
                       "reason": (
                           f"[PRE-TOOL GUARD] Subcommand `agentapi {bad_subcmd.group(1)}` does not exist! "
-                          f"Use this EXACT command:\n`{cmd_prefix} --model=pro --title=\"{new_title}\" \"<prompt>\"`"
+                          f"Use this EXACT command:\n`{cmd_prefix} --model=gemini-4-carbon-high --title=\"{new_title}\" \"<prompt>\"`"
                       ),
                   },
                   ensure_ascii=False,
@@ -6227,7 +6284,7 @@ def main() -> None:
 
           if "--model" not in rewritten:
             rewritten = AGENTAPI_NEW_CONV_RE.sub(
-                lambda m: f"{m.group(0)} --model=pro", rewritten, count=1
+                lambda m: f"{m.group(0)} --model=gemini-4-carbon-high", rewritten, count=1
             )
             needs_rewrite = True
 

@@ -113,6 +113,45 @@ def is_step0_broken_contrib_model(model_id: str = "", model_enum: str = "") -> b
   return mid in STEP0_BROKEN_CONTRIB_IDS or enum in STEP0_BROKEN_CONTRIB_ENUMS
 
 
+# Gemini <= 3.1 (3.1 Pro/Flash Lite, 3.0, 2.x) is banned everywhere except image generation
+LEGACY_MODEL_ID_RE = re.compile(r"gemini-(?:[12]\.\d|3\.[01])\b", re.IGNORECASE)
+LEGACY_MODEL_LABEL_RE = re.compile(r"Gemini (?:[12]\.\d|3\.[01])\b", re.IGNORECASE)
+LEGACY_MODEL_ENUMS = frozenset({
+    "MODEL_PLACEHOLDER_M37",
+    "MODEL_PLACEHOLDER_M50",
+    "MODEL_PLACEHOLDER_M312",
+    "MODEL_PLACEHOLDER_M333",
+})
+IMAGE_MODEL_ENUMS = frozenset({"MODEL_PLACEHOLDER_M21"})
+# agentapi tier `pro` resolves to Gemini 3.1 Pro (Low); agentapi accepts model ids and
+# falls back to the flash tier (gemini-3.8-flash-tiered) when the id is unavailable
+AGENTAPI_SAFE_PRO_MODEL = "gemini-4-carbon-high"
+
+
+def is_legacy_model(model_id: str = "", enum: str = "", label: str = "") -> bool:
+  """Returns True if any of id / enum / display label names a Gemini <= 3.1 model.
+
+  Image-generation models (e.g. gemini-3.1-flash-image, MODEL_PLACEHOLDER_M21) are exempt.
+  Checks all three because the live catalog aliases legacy ids under newer display names.
+  """
+  mid = (model_id or "").strip()
+  en = (enum or "").strip().upper()
+  lbl = (label or "").strip()
+  if en in IMAGE_MODEL_ENUMS or "image" in mid.lower() or "image" in lbl.lower():
+    return False
+  if en in LEGACY_MODEL_ENUMS or re.match(r"MODEL_GOOGLE_GEMINI_(?:FOR_GOOGLE_)?2_", en):
+    return True
+  return bool(LEGACY_MODEL_ID_RE.search(mid) or LEGACY_MODEL_LABEL_RE.search(lbl))
+
+
+def agentapi_model_arg(model: str) -> str:
+  """Maps a requested agentapi `--model` value to a non-legacy one (tier or model id)."""
+  m = (model or "").strip()
+  if m == "pro" or is_legacy_model(m, m, m):
+    return AGENTAPI_SAFE_PRO_MODEL
+  return m
+
+
 # Flagship-only fallback chains for cpp-core and orchestrator (no Gemini 3.1 or Flash)
 MODEL_PROFILES: dict[str, list[str]] = {
     # Restrict cpp-core strictly to Opus 5.5 and Gemini 4 Carbon/Argon (no coordinator/auto)
@@ -140,7 +179,6 @@ MODEL_PROFILES: dict[str, list[str]] = {
         "gemini-flash-next",
         "gemini-3.8-flash-high",
         "gemini-3.8-flash-medium",
-        "gemini-2.5-flash",
         "gemini-3.5-flash-lite",
         "gemini-pro-coordinator",
         "auto",
@@ -1026,7 +1064,7 @@ CURATED_MODEL_LABELS = {
 def lookup_model(models: dict, wanted: str) -> dict:
   """Resolves a model id / display name / enum name among enabled catalog entries."""
   w = (wanted or "").strip().lower()
-  if not w or is_forbidden_bon_model(w, w):
+  if not w or is_forbidden_bon_model(w, w) or is_legacy_model(w, w, w):
     return {}
   for mid, det in models.items():
     if det.get("disabled"):
@@ -1035,6 +1073,9 @@ def lookup_model(models: dict, wanted: str) -> dict:
     if is_forbidden_bon_model(mid, enum):
       continue
     label = det.get("displayName", "")
+    # Legacy ids share newer display names in the live catalog, so skip them by id/enum
+    if is_legacy_model(mid, enum, label):
+      continue
     curated_label = CURATED_MODEL_LABELS.get(mid, "")
     cand_labels = (label.lower(), curated_label.lower())
     if w in (mid.lower(), enum.lower()) or any(w == c for c in cand_labels if c):
@@ -1533,6 +1574,12 @@ def resolve_handoff_model(
   if explicit:
     if explicit in AGENTAPI_TIERS:
       hit = from_tier(explicit)
+    elif is_legacy_model(explicit, explicit, explicit):
+      # Gemini <= 3.1 is banned: launch on the profile default rather than fail the handoff
+      profile = "triage" if "flash" in explicit.lower() else "orchestrator"
+      hit = resolve_profile_model(models, profile)
+      hit = {**hit, "source": "explicit:legacy_fallback"} if hit else {}
+      sys.stderr.write(f"Warning: --model '{explicit}' is Gemini <= 3.1 (banned)\n")
     else:
       hit = lookup_model(models, explicit)
       hit = {**hit, "source": "explicit"} if hit else {}
@@ -1598,7 +1645,7 @@ def resolve_handoff_model(
           return _check_and_return({**balanced, "source": "inherited:pool_balance"})
       if q >= QUOTA_SOFT_FLOOR:
         return _check_and_return({**hit, "source": "inherited"})
-    # Fail over when inherited model is exhausted below the 30% soft floor
+    # Fail over when inherited model is below the 30% soft floor or Gemini <= 3.1 (no hit)
     fallback = resolve_profile_model(models, fb_profile)
     if fallback:
       return _check_and_return({**fallback, "source": "inherited:quota_fallback"})
@@ -3085,7 +3132,8 @@ def create_handoff(
      (explicit --model -> inherited from the current chat's last turn -> $HANDOFF_MODEL /
      <app_data_dir>/handoff_model -> agentapi tier `model`), preserving ANTIGRAVITY_PROJECT_ID
      and sending no sourceMetadata (chat stays visible). Falls back to
-     `agentapi new-conversation --model=<tier>` if the RPC path is unavailable.
+     `agentapi new-conversation --model=<agentapi_model_arg(tier)>` if the RPC path is
+     unavailable.
      In a project the state file and owned `doing` items move to the new chat
      before its first message (RPC path) or right after launch (agentapi path).
   4. Advances lifecycle chain markers (advances old chat to ✓ and new to ⦿).
@@ -3305,13 +3353,16 @@ def create_handoff(
       pass
     raise RuntimeError(f"state file handover failed, no continuation was started: {exc}") from exc
   except Exception as exc:
-    model_info = {"source": f"agentapi tier:{model}", "fallback_reason": str(exc)[:300]}
+    model_info = {
+        "source": f"agentapi model:{agentapi_model_arg(model)}",
+        "fallback_reason": str(exc)[:300],
+    }
     env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_SOURCE_METADATA"}
     env["ANTIGRAVITY_PROJECT_ID"] = project_id_final
     cmd = [
         "agentapi",
         "new-conversation",
-        f"--model={model}",
+        f"--model={agentapi_model_arg(model)}",
         f"--title={cont_title}",
         prompt,
     ]
@@ -3724,7 +3775,7 @@ def create_next_task(
     ) from exc
   except Exception as exc:
     model_info = {
-        "source": f"agentapi tier:{model}",
+        "source": f"agentapi model:{agentapi_model_arg(model)}",
         "fallback_reason": str(exc)[:300],
     }
     env = {
@@ -3736,7 +3787,7 @@ def create_next_task(
     cmd = [
         "agentapi",
         "new-conversation",
-        f"--model={model}",
+        f"--model={agentapi_model_arg(model)}",
         f"--title={cont_title}",
         prompt,
     ]
@@ -4662,10 +4713,11 @@ Notes:
   * Model of a continuation: --model <id|display name|enum|flash_lite|flash|pro>
     -> project default (projects_models.json / DEFAULT_PROJECT_MODELS / project.json)
     -> model of <id>'s last turn (inherit) -> $HANDOFF_MODEL or the first
-    non-comment line of <app_data_dir>/handoff_model -> agentapi tier "pro".
-    Candidates are validated against GetAvailableModels. `agentapi
-    new-conversation` itself knows only Gemini tiers (pro = "Gemini 3.1 Pro
-    (Low)" in Antigravity), which is why the launch goes through the LS RPC.
+    non-comment line of <app_data_dir>/handoff_model -> first named model of the
+    agentapi tier (pro -> gemini-4-carbon-high). Candidates are validated against
+    GetAvailableModels; Gemini <= 3.1 models are never selected (explicit ones fall
+    back to the profile default). The agentapi `pro` tier is Gemini <= 3.1, so the
+    `agentapi new-conversation` fallback passes --model=gemini-4-carbon-high instead.
 """
 
 

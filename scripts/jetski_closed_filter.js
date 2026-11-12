@@ -558,6 +558,14 @@
     1420,
     1421,
   ]);
+  // Gemini <= 3.1 is banned for chat after unreliable results; live catalogs alias these ids to
+  // newer display names, so ids and enums decide and labels only back them up
+  const LEGACY_MODEL_ENUMS = new Set([
+    246, 312, 313, 327, 329, 330, 331, 1037, 1050, 1312, 1333,
+  ]);
+  const LEGACY_MODEL_ID_RE = /^gemini-(?:[12]\.\d|3\.[01])(?:-|$)/i;
+  const LEGACY_MODEL_ENUM_RE = /^MODEL_GOOGLE_GEMINI_(?:FOR_GOOGLE_)?2_/;
+  const LEGACY_MODEL_LABEL_RE = /^gemini (?:[12]\.\d|3\.[01])\b/i;
 
   // Models whose Antigravity 2.28.2 feature flags activate the broken model_router_plan
   // contrib variant on step 0 (when previousContribVariant is nil), crashing constructExecutor
@@ -572,10 +580,6 @@
   const CURATED_HIDDEN_MODELS = [
     ['gemini-3.8-flash-router', 'Gemini 3.8 Flash Router', 'Exp'],
     ['snowball-subagent', 'Gemini Snowball Subagent', 'Exp'],
-    ['gemini-3.1-flash-lite', 'Gemini 3.1 Flash Lite', 'Exp'],
-    ['gemini-2.5-flash-thinking', 'Gemini 2.5 Flash (Thinking)', '2.5'],
-    ['gemini-2.5-flash', 'Gemini 2.5 Flash', '2.5'],
-    ['gemini-2.5-flash-lite', 'Gemini 2.5 Flash Lite', '2.5'],
     ['opus-5.5-medium', 'Claude Opus 5.5 (Medium)', 'WTU'],
     ['gemini-pro-coordinator', 'Gemini Pro Orchestrator', 'Pro'],
   ];
@@ -634,14 +638,12 @@
     'gemini-launch-candidate-medium',
     'gemini-pro-coordinator',
     'auto',
-    // Tier 2: Secondary & modern 3.8 Flash reserve (ranked above legacy Gemini 3.1 Pro / snowball)
+    // Tier 2: Secondary & modern 3.8 Flash reserve
     'fable-5.1-dropdown',
     'gemini-flash-next',
     'gemini-3.8-flash-high',
     'gemini-3.8-flash-medium',
-    // Tier 3: Legacy / light models
-    'gemini-3.1-pro-high',
-    'gemini-2.5-flash',
+    // Tier 3: Light models
     'gemini-3.5-flash-lite',
   ];
   const PREFERRED_DROPDOWN_ORDER_MAP = new Map(
@@ -753,7 +755,6 @@
       'gemini-flash-next',
       'gemini-3.8-flash-high',
       'gemini-3.8-flash-medium',
-      'gemini-2.5-flash',
       'gemini-3.5-flash-lite',
       'gemini-pro-coordinator',
       'auto',
@@ -2962,25 +2963,25 @@
             let reason = '';
             // Distinguishes morning primary-model restoration from quota-exhaustion failovers
             let isQuotaRestore = false;
-            const isForbiddenBon = isForbiddenBonModel(
-              entry?.modelId || String(planModel),
-              planModel
-            );
-            if (isForbiddenBon) {
+            const blockedId = entry?.modelId || String(planModel);
+            const isBlocked = isBlockedModel(blockedId, planModel);
+            if (isBlocked) {
               deleteManualPin(pinKey);
               autoSeededTargets.delete(pinKey);
             }
-            // Substitute Auto sentinel or forbidden BoN model with the project profile model
+            // Substitute Auto sentinel or blocked model with the project profile model
             const entryEnumNum = entry?.enumVal || resolveModelEnumValue(String(planModel || ''));
             const isCarbonOrArgon =
               CARBON_ENUM_NUMS.has(entryEnumNum) || ARGON_ENUM_NUMS.has(entryEnumNum);
             const effectiveHardFloor =
               isPinned || isCarbonOrArgon ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR;
-            if (isAutopilotSentinel || isForbiddenBon) {
+            if (isAutopilotSentinel || isBlocked) {
               // Reuse resolved conversation profile so draft/route fallback runs once per request
               const profile = convProfile || 'orchestrator';
               replacement = resolveAutopilotModelForProfile(catalog, profile);
-              reason = isForbiddenBon ? 'BoN disabled' : `${profile} profile`;
+              reason = isBlocked
+                ? blockedModelReason(blockedId, planModel)
+                : `${profile} profile`;
             // Preserve manual user pins even below 5% so pinned models wait for reset instead of switching
             } else if (!isPinned && entry && entry.quota < effectiveHardFloor) {
               const profile = convProfile || 'orchestrator';
@@ -3045,7 +3046,7 @@
             }
             // Promote draft manual pin to the new cascadeId on StartCascade and free the draft slot
             if (url.includes('/StartCascade') && pinKey.startsWith('__draft__:')) {
-              if (body.cascadeId && pin && !isForbiddenBon) {
+              if (body.cascadeId && pin && !isBlocked) {
                 // Keep the intended router model pinned rather than the temporary step-0 model
                 const nextPinModel = isStep0Bootstrap
                   ? candidateEnum
@@ -3071,7 +3072,7 @@
                 targetEnum: candidateEnum,
                 bootstrapEnum: replacement.enumVal,
                 wasPinned: Boolean(
-                  isPinned || (pin && !isForbiddenBon && pin.model === candidateEnum)
+                  isPinned || (pin && !isBlocked && pin.model === candidateEnum)
                 ),
               };
               if (rawCid) {
@@ -3177,6 +3178,29 @@
     return false;
   }
 
+  // Returns true for Gemini <= 3.1 chat models; image generation arms stay usable
+  function isLegacyModel(modelId, modelEnum, label) {
+    const mid = String(modelId || '').trim();
+    if (/image/i.test(mid)) return false;
+    if (mid && LEGACY_MODEL_ID_RE.test(mid)) return true;
+    const rawEnum = String(typeof modelEnum === 'number' ? '' : modelEnum || '').trim();
+    if (rawEnum && LEGACY_MODEL_ENUM_RE.test(rawEnum)) return true;
+    const numVal = typeof modelEnum === 'number' ? modelEnum : resolveModelEnumValue(rawEnum);
+    if (numVal && LEGACY_MODEL_ENUMS.has(numVal)) return true;
+    const lbl = String(label || '').trim();
+    return Boolean(lbl && !/image/i.test(lbl) && LEGACY_MODEL_LABEL_RE.test(lbl));
+  }
+
+  // Returns true for models that must never run: BoN preview arms and Gemini <= 3.1
+  function isBlockedModel(modelId, modelEnum, label) {
+    return isForbiddenBonModel(modelId, modelEnum) || isLegacyModel(modelId, modelEnum, label);
+  }
+
+  // Names the reason shown in the autopilot toast when a blocked model is replaced
+  function blockedModelReason(modelId, modelEnum) {
+    return isForbiddenBonModel(modelId, modelEnum) ? 'BoN disabled' : 'Gemini <= 3.1 disabled';
+  }
+
   // Returns true when modelId or modelEnum activates the broken step-0 model_router_plan variant
   function isStep0BrokenContribModel(modelId, modelEnum) {
     const mid = String(modelId || '').trim().toLowerCase();
@@ -3238,17 +3262,19 @@
     return 0;
   }
 
-  // Formats remaining time until quota reset as a concise duration string
-  function formatQuotaResetRemaining(resetMs) {
-    if (!resetMs || resetMs <= 0) return '';
-    const diffMs = resetMs - Date.now();
-    if (diffMs <= 0) return '';
-    const totalMins = Math.max(1, Math.ceil(diffMs / 60000));
-    const hours = Math.floor(totalMins / 60);
-    const mins = totalMins % 60;
-    if (hours > 0 && mins > 0) return `resets in ${hours}h ${mins}m`;
-    if (hours > 0) return `resets in ${hours}h`;
-    return `resets in ${mins}m`;
+  const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  // Formats a future quota reset as browser-local HH:MM, or Ddd HH:MM on another local day;
+  // absolute clocks stay true between enrichments, unlike a relative countdown
+  function formatQuotaResetClock(resetMs) {
+    const now = Date.now();
+    if (!resetMs || resetMs <= now) return '';
+    const at = new Date(resetMs);
+    const clock = `${String(at.getHours()).padStart(2, '0')}:` +
+      String(at.getMinutes()).padStart(2, '0');
+    return at.toDateString() === new Date(now).toDateString()
+      ? clock
+      : `${WEEKDAY_SHORT[at.getDay()]} ${clock}`;
   }
 
   // Computes effective remaining quota fraction [0.0, 1.0] handling Protobuf3 0.0 omission
@@ -3294,10 +3320,12 @@
     }
     const frac = getEffectiveQuotaFraction(quotaInfo, rawTitle, rawDesc);
     const pct = Math.round(frac * 100);
-    const tagTitle = rawTitle ? `${rawTitle} · ${pct}%` : `${pct}%`;
-    const resetText = formatQuotaResetRemaining(resetMs);
+    const resetClock = formatQuotaResetClock(resetMs);
+    // The pill names the reset only below the soft floor, where the wait matters, to stay narrow
+    const pill = resetClock && frac < QUOTA_SOFT_FLOOR ? `${pct}% ↻${resetClock}` : `${pct}%`;
+    const tagTitle = rawTitle ? `${rawTitle} · ${pill}` : pill;
     const descParts = [`${pct}% quota left`];
-    if (resetText) descParts.push(resetText);
+    if (resetClock) descParts.push(`resets ${resetClock}`);
     const fallbackDesc = rawDesc || (typeof modelId === 'string' ? modelId.trim() : '');
     if (fallbackDesc) descParts.push(fallbackDesc);
     return { tagTitle, tagDescription: descParts.join(' · ') };
@@ -3361,7 +3389,7 @@
     const modelsMap = availableModelsCache?.models;
     if (modelsMap && typeof modelsMap === 'object') {
       for (const [mid, det] of Object.entries(modelsMap)) {
-        if (!det || typeof det !== 'object' || isForbiddenBonModel(mid, det.model)) continue;
+        if (!det || typeof det !== 'object' || isBlockedModel(mid, det.model)) continue;
         const enumVal = resolveModelEnumValue(det.model);
         const curated = CURATED_HIDDEN_MODEL_MAP.get(mid);
         const label = curated?.label || det.displayName || humanizeModelId(mid);
@@ -3382,12 +3410,12 @@
     const configs = store?.getState()?.userStatus?.cascadeModelConfigData?.clientModelConfigs;
     if (Array.isArray(configs)) {
       for (const cfg of configs) {
-        // Exclude the synthetic Auto reset entry and forbidden BoN arms from executable candidates
+        // Exclude the synthetic Auto reset entry and blocked models from executable candidates
         if (!cfg || cfg.modelId === AUTOPILOT_OPTION_MODEL_ID) continue;
         const mid = cfg.modelId || '';
         const numVal = cfg.modelOrAlias?.choice?.value;
         const enumVal = typeof numVal === 'number' ? numVal : 0;
-        if (isForbiddenBonModel(mid, enumVal)) continue;
+        if (isBlockedModel(mid, enumVal)) continue;
         const label = cfg.label || mid;
         const quota = getEffectiveQuotaFraction(cfg.quotaInfo, cfg.tagTitle, cfg.tagDescription);
         const prev = (mid && byId.get(mid.toLowerCase())) || (enumVal && byEnum.get(enumVal));
@@ -3454,18 +3482,17 @@
       .replace(/^profile:/, '');
 
     if (p === 'triage') {
-      const hitFlash25 =
-        catalog.byId.get('gemini-2.5-flash') || catalog.byId.get('gemini-3.5-flash-lite');
+      const hitLite = catalog.byId.get('gemini-3.5-flash-lite');
       const hitFlashNext =
         catalog.byId.get('gemini-flash-next') ||
         catalog.byId.get('gemini-3.8-flash-high') ||
         catalog.byId.get('gemini-3.8-flash-medium');
-      const q25 = hitFlash25 ? hitFlash25.quota : 0;
+      const qLite = hitLite ? hitLite.quota : 0;
       const qNext = hitFlashNext ? hitFlashNext.quota : 0;
-      if ((hitFlash25 && q25 >= softFloor) || (hitFlashNext && qNext >= softFloor)) {
-        if (hitFlash25 && q25 > qNext + 0.05 && q25 >= softFloor) return hitFlash25;
+      if ((hitLite && qLite >= softFloor) || (hitFlashNext && qNext >= softFloor)) {
+        if (hitLite && qLite > qNext + 0.05 && qLite >= softFloor) return hitLite;
         if (hitFlashNext && qNext >= softFloor) return hitFlashNext;
-        if (hitFlash25) return hitFlash25;
+        if (hitLite) return hitLite;
       }
     }
 
@@ -3736,7 +3763,6 @@
           'gemini-flash-next',
           'gemini-3.8-flash-high',
           'gemini-3.8-flash-medium',
-          'gemini-2.5-flash',
           'auto',
         ]
       : ['auto', ...(WEB_MODEL_PROFILES[cleanProfile] || WEB_MODEL_PROFILES.orchestrator)];
@@ -3845,7 +3871,7 @@
       for (const [k, v] of Object.entries(parsed)) {
         if (!k) continue;
         const model = typeof v === 'number' ? v : Number(v?.model);
-        if (!Number.isFinite(model) || model <= 0 || isForbiddenBonModel('', model)) continue;
+        if (!Number.isFinite(model) || model <= 0 || isBlockedModel('', model)) continue;
         const atStep = typeof v === 'object' && v ? Math.max(0, Number(v.atStep || 0)) : 0;
         const updatedAt =
           typeof v === 'object' && v && Number.isFinite(Number(v.updatedAt))
@@ -3891,7 +3917,7 @@
       for (const [k, v] of manualPickedModels.entries()) {
         if (!k || !v) continue;
         const model = typeof v === 'number' ? v : Number(v.model);
-        if (!Number.isFinite(model) || model <= 0 || isForbiddenBonModel('', model)) {
+        if (!Number.isFinite(model) || model <= 0 || isBlockedModel('', model)) {
           manualPickedModels.delete(k);
           continue;
         }
@@ -3952,7 +3978,7 @@
               : 0,
           };
     if (
-      isForbiddenBonModel('', entry.model) ||
+      isBlockedModel('', entry.model) ||
       (String(key).startsWith('__draft__:') && now - entry.updatedAt > DRAFT_MANUAL_PIN_TTL_MS)
     ) {
       manualPickedModels.delete(key);
@@ -3964,7 +3990,7 @@
 
   // Writes or advances a per-chat manual pin while preserving permanent/reset metadata across turns
   function setManualPin(key, modelEnum, atStep = 0, options = null) {
-    if (!key || !modelEnum || isForbiddenBonModel('', modelEnum)) return;
+    if (!key || !modelEnum || isBlockedModel('', modelEnum)) return;
     // Inherit permanent/resetAtMs when trajectoryModelObserved advances atStep on the same pin
     const numModel = Number(modelEnum);
     const prev = manualPickedModels.get(key);
@@ -4053,7 +4079,7 @@
           targetEnum <= 0 ||
           !Number.isFinite(bootstrapEnum) ||
           bootstrapEnum <= 0 ||
-          isForbiddenBonModel('', targetEnum)
+          isBlockedModel('', targetEnum)
         ) {
           continue;
         }
@@ -4519,9 +4545,9 @@
     }
     if (!curModel) return;
     const curEntry = catalog.byEnum.get(curModel);
-    const isForbiddenBon = isForbiddenBonModel(curEntry?.modelId || '', curModel);
+    const isBlocked = isBlockedModel(curEntry?.modelId || '', curModel);
     // Pinned chats never auto-downgrade; Carbon/Argon models use the 5% emergency floor
-    const isPinned = Boolean(!isForbiddenBon && pin && pin.model === curModel);
+    const isPinned = Boolean(!isBlocked && pin && pin.model === curModel);
     const isCarbonOrArgon =
       CARBON_ENUM_NUMS.has(curModel) || ARGON_ENUM_NUMS.has(curModel);
     const effectiveHardFloor =
@@ -4531,13 +4557,13 @@
     let reason = '';
     // Tracks morning quota recovery so the toast offers a one-click [Keep <Junior>] revert
     let isQuotaRestore = false;
-    if (isForbiddenBon) {
+    if (isBlocked) {
       deleteManualPin(cascadeId);
       replacement = resolveAutopilotModelForProfile(
         catalog,
         profile || 'orchestrator'
       );
-      reason = 'BoN disabled';
+      reason = blockedModelReason(curEntry?.modelId || '', curModel);
     } else if (!isPinned && curEntry && curEntry.quota < effectiveHardFloor) {
       const candidate = resolveAutopilotModelForProfile(
         catalog,
@@ -4786,9 +4812,48 @@
     return true;
   }
 
+  // Removes server-native Gemini <= 3.1 configs and their sort labels so the picker never offers
+  // them; cleanup does not restore them since a re-injected instance would drop them again.
+  // Configs are matched per entry, not by label: the catalog aliases legacy ids under allowed
+  // labels, so a label is dropped from sorts only when no surviving config still carries it
+  function dropLegacyNativeModels(status) {
+    const data = status?.cascadeModelConfigData;
+    if (!data || !Array.isArray(data.clientModelConfigs)) return status;
+    const isLegacyCfg = (cfg) =>
+      !!cfg && isLegacyModel(cfg.modelId, cfg.modelOrAlias?.choice?.value, cfg.label);
+    const kept = data.clientModelConfigs.filter((cfg) => !isLegacyCfg(cfg));
+    if (kept.length === data.clientModelConfigs.length) return status;
+    const keptLabels = new Set(kept.map((cfg) => cfg?.label));
+    const legacyLabels = new Set(
+      data.clientModelConfigs
+        .filter((cfg) => isLegacyCfg(cfg) && cfg.label && !keptLabels.has(cfg.label))
+        .map((cfg) => cfg.label)
+    );
+    const sorts = Array.isArray(data.clientModelSorts)
+      ? data.clientModelSorts.map((sort) => {
+          if (!sort || !Array.isArray(sort.groups)) return sort;
+          return cloneWithProto(sort, {
+            groups: sort.groups.map((group) =>
+              group && Array.isArray(group.modelLabels)
+                ? cloneWithProto(group, {
+                    modelLabels: group.modelLabels.filter((lbl) => !legacyLabels.has(lbl)),
+                  })
+                : group
+            ),
+          });
+        })
+      : data.clientModelSorts;
+    return cloneWithProto(status, {
+      cascadeModelConfigData: cloneWithProto(data, {
+        clientModelConfigs: kept,
+        clientModelSorts: sorts,
+      }),
+    });
+  }
+
   // Appends hidden executable models from GetAvailableModels and enriches quota tags
   function enrichUserStatusWithHiddenModels(userStatus, availablePayload) {
-    const baseStatus = stripUnlockedModels(userStatus);
+    const baseStatus = dropLegacyNativeModels(stripUnlockedModels(userStatus));
     const data = baseStatus?.cascadeModelConfigData;
     if (!data || !Array.isArray(data.clientModelConfigs) || data.clientModelConfigs.length === 0) {
       return baseStatus;
@@ -4953,12 +5018,12 @@
         continue;
       }
       const entry = modelsMap[modelId];
-      // Skip internal routing placeholders and forbidden SERVING_TYPE_BON preview arms
+      // Skip internal routing placeholders, BoN preview arms, and Gemini <= 3.1
       if (
         !entry ||
         typeof entry !== 'object' ||
         entry.apiProvider === 'API_PROVIDER_INTERNAL' ||
-        isForbiddenBonModel(modelId, entry.model)
+        isBlockedModel(modelId, entry.model)
       ) {
         continue;
       }
@@ -5251,9 +5316,9 @@
         }
 
         const entry = catalog.byEnum.get(pickedModel);
-        const isForbiddenBon = isForbiddenBonModel(entry?.modelId || '', pickedModel);
-        // Only rescue forbidden BoN picks; never override a user's manual model choice on low quota
-        if (isForbiddenBon) {
+        const isBlocked = isBlockedModel(entry?.modelId || '', pickedModel);
+        // Only rescue blocked picks; never override a user's manual model choice on low quota
+        if (isBlocked) {
           const profile =
             resolveProjectProfileForConversation(store, action.payload.conversationId) ||
             'orchestrator';
@@ -5261,9 +5326,9 @@
           if (rescue && rescue.enumVal && rescue.enumVal !== pickedModel) {
             deleteManualPin(pinKey);
             showAutopilotToast(
-              entry?.label || String(pickedModel),
+              entry?.label || CURATED_ENUM_LABELS.get(pickedModel) || String(pickedModel),
               rescue.label,
-              'BoN disabled'
+              blockedModelReason(entry?.modelId || '', pickedModel)
             );
             return origDispatch.call(this, {
               ...action,
@@ -5271,7 +5336,7 @@
             });
           }
         }
-        if (pickedModel && !isForbiddenBon) {
+        if (pickedModel && !isBlocked) {
           const targetCid = rawCid || activeCid;
           const profile = resolveProjectProfileForConversation(store, targetCid);
           const nominal = profile ? resolveNominalProfileModel(catalog, profile) : null;
@@ -13466,7 +13531,7 @@
 
         const body = JSON.stringify({
           prompt: promptLines,
-          model: 'MODEL_GOOGLE_GEMINI_2_5_FLASH',
+          model: 'MODEL_PLACEHOLDER_M198',
         });
 
         const resp = await window.fetch(url, {
