@@ -150,6 +150,7 @@ class WatcherAndTriageBugfixTest(unittest.TestCase):
                 "target_id": "1410416",
                 "host": "skia-review.googlesource.com",
                 "is_self": True,
+                "is_wip": True,
                 "status": "NEW",
                 "companion_to": "gerrit:1409697",
                 "ready_to_abandon_reason": "You approved CL 1409697 (PS6)",

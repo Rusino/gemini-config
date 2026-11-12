@@ -1,6 +1,7 @@
 # Copyright 2026 Google LLC.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import copy
 import json
 import os
@@ -1127,6 +1128,387 @@ console.log(JSON.stringify({
     self.assertNotIn("companion_to", items_out["gerrit:1410007@unchatted"])
     self.assertEqual(items_out["gerrit:1410008@unchatted"]["status"], "NEW")
     self.assertNotIn("companion_to", items_out["gerrit:1410008@unchatted"])
+
+  # Checks that non-WIP standalone self CLs stacked on external CLs never get silent
+  # companion links or borrow the external parent's 1:1 review chat
+  def test_non_wip_stacked_self_cl_not_classified_or_retagged_as_companion(self):
+    items = {
+        "gerrit:1418836": {
+            "item_key": "gerrit:1418836",
+            "target_id": "1418836",
+            "kind": "gerrit",
+            "host": w.GERRIT_SKIA_HOST,
+            "is_self": False,
+            "is_external": True,
+            "status": "NEW",
+            "patchset": 1,
+            "subject": "[skparagraph] Do not decode the text to find a soft hyphen",
+            "revision_ps_by_sha": {"0f04f77bc2": 1},
+            "parent_commit": "sha_main",
+            "conversation_id": "c-ext-1418836",
+            "single_target": True,
+        },
+        "gerrit:1421862": {
+            "item_key": "gerrit:1421862",
+            "target_id": "1421862",
+            "kind": "gerrit",
+            "host": w.GERRIT_SKIA_HOST,
+            "is_self": True,
+            "is_external": False,
+            "is_wip": False,
+            "is_draft": False,
+            "in_development": True,
+            "status": "NEW",
+            "patchset": 1,
+            "subject": "[skparagraph] Find soft hyphen clusters once, in the Cluster constructor",
+            "revision_ps_by_sha": {"sha_1421862_ps1": 1},
+            "parent_commit": "0f04f77bc2",
+            "conversation_id": "",
+            "single_target": True,
+        },
+    }
+    discovered = [dict(items["gerrit:1418836"]), dict(items["gerrit:1421862"])]
+    with mock.patch.object(
+        w, "fetch_gerrit_related_cl_ids", return_value=["1421862", "1418836"]
+    ):
+      w.link_companion_changes_to_parent_chats(discovered, items)
+
+    child = next(d for d in discovered if d["item_key"] == "gerrit:1421862")
+    self.assertNotIn("companion_to", child)
+    self.assertFalse(child.get("is_companion", False))
+    self.assertEqual(child.get("conversation_id"), "")
+
+    stale_rec = {
+        **items["gerrit:1421862"],
+        "in_development": False,
+        "assigned_reviewers_count": 2,
+        "approved_count": 1,
+        "companion_to": "gerrit:1418836",
+    }
+    fake_chats = [{
+        "item_key": "gerrit:1418836",
+        "conversation_id": "c-ext-1418836",
+        "chat_archived": False,
+        "is_self": False,
+        "single_target": True,
+    }]
+    with mock.patch.object(
+        w, "discover_active_cl_chats", return_value=fake_chats
+    ), mock.patch.object(
+        w, "fetch_gerrit_related_cl_ids", return_value=["1421862", "1418836"]
+    ):
+      cid, is_arch, comp_to = w._discover_existing_chat_for_item(
+          "gerrit:1421862", stale_rec
+      )
+    self.assertEqual((cid, is_arch, comp_to), ("", False, ""))
+
+  # Checks that a stacked CL turned ready-for-review drops stale companion_to and that
+  # non-WIP or approved changes are never unattendedly auto-abandoned when the parent merges
+  def test_sync_once_drops_stale_companion_and_never_auto_abandons_reviewed_non_wip_cl(
+      self,
+  ):
+    def make_cl(tid: str, **kw):
+      rec = {
+          "ok": True,
+          "host": w.GERRIT_SKIA_HOST,
+          "url": f"https://{w.GERRIT_SKIA_HOST}/c/skia/+/{tid}",
+          "status": "NEW",
+          "phase": "WAITING_ON_REVIEWERS",
+          "subject": f"[skparagraph] CL {tid}",
+          "owner_name": "Julia Lavrova",
+          "owner_email": "jlavrova@google.com",
+          "role": "author",
+          "is_self": True,
+          "is_external": False,
+          "is_wip": False,
+          "is_draft": False,
+          "in_development": False,
+          "is_watching": False,
+          "reviewer_removed": False,
+          "self_approved": False,
+          "self_approval_ps": 0,
+          "patchset": 2,
+          "revision": f"rev_{tid}",
+          "parent_commit": "0f04f77bc2",
+          "revision_ps_by_sha": {f"rev_{tid}": 2},
+          "commit_message": "",
+          "files": [],
+          "hashtags": [],
+          "topic": "",
+          "in_my_attention": False,
+          "last_msg_author": "alexisdavidc@google.com",
+          "last_msg_date": "2026-11-11 18:45:00.000000000",
+          "last_msg_snippet": "Patch Set 2: Code-Review+1",
+          "status_changed_raw": "2026-11-11 18:45:00.000000000",
+          "submitted": "",
+          "post_submit": {},
+      }
+      rec.update(kw)
+      return rec
+
+    prev_state = {
+        "items": {
+            f"gerrit:{tid}@unchatted": {
+                "item_key": f"gerrit:{tid}",
+                "target_id": tid,
+                "kind": "gerrit",
+                "host": w.GERRIT_SKIA_HOST,
+                "is_self": True,
+                "is_wip": True,
+                "status": "NEW",
+                "parent_commit": "0f04f77bc2",
+                "companion_to": "gerrit:1418836",
+                "is_companion": True,
+            }
+            for tid in ("1421862", "1421898", "1421899")
+        },
+        "events": [],
+    }
+    cl_infos = {
+        "1418836": make_cl(
+            "1418836",
+            status="MERGED",
+            phase="MERGED",
+            subject="[skparagraph] Do not decode the text to find a soft hyphen",
+            owner_name="YeungKC",
+            owner_email="I@YeungKC.com",
+            role="reviewer (ext)",
+            is_self=False,
+            is_external=True,
+            self_approved=True,
+            self_approval_ps=1,
+            revision="267037d7a2",
+            parent_commit="sha_main",
+            revision_ps_by_sha={"0f04f77bc2": 1, "267037d7a2": 2},
+            submitted="2026-11-11 19:39:00.000000000",
+        ),
+        "1421862": make_cl(
+            "1421862",
+            subject="[skparagraph] Find soft hyphen clusters once, in the Cluster constructor",
+            assigned_reviewers=["alexisdavidc@google.com", "fmalita@google.com"],
+            assigned_reviewers_count=2,
+            approved_count=1,
+            missing_approvals=0,
+            patchset=3,
+            revision="rev_1421862_ps3",
+            revision_ps_by_sha={"rev_1421862_ps3": 3},
+        ),
+        "1421898": make_cl(
+            "1421898",
+            subject="[skparagraph] Companion fix for CL 1418836",
+            assigned_reviewers=["fmalita@google.com"],
+            assigned_reviewers_count=1,
+            approved_count=0,
+            missing_approvals=1,
+        ),
+        "1421899": make_cl(
+            "1421899",
+            subject="[skparagraph] Companion fix for CL 1418836",
+            is_wip=True,
+            is_draft=True,
+            assigned_reviewers=["fmalita@google.com"],
+            assigned_reviewers_count=1,
+            approved_count=1,
+            missing_approvals=0,
+        ),
+    }
+    abandoned_urls: list[str] = []
+
+    def fake_urlopen(req, timeout=30):
+      url = req.full_url if hasattr(req, "full_url") else str(req)
+      if "/abandon" in url:
+        abandoned_urls.append(url)
+      resp = mock.MagicMock(status=200)
+      resp.read.return_value = b")]}'\n{}"
+      resp.__enter__.return_value = resp
+      return resp
+
+    remote = [
+        {"item_key": f"gerrit:{t}", "target_id": t, "kind": "gerrit"}
+        for t in ("1421862", "1421898", "1421899")
+    ]
+    patches = [
+        mock.patch.object(w, "load_watcher_state", return_value=prev_state),
+        mock.patch.object(w, "save_watcher_state"),
+        mock.patch.object(w, "fetch_gardener_snapshot", return_value=({}, [])),
+        mock.patch.object(w, "load_project_names", return_value={}),
+        mock.patch.object(w, "discover_active_cl_chats", return_value=[]),
+        mock.patch.object(w, "discover_open_remote_changes", return_value=remote),
+        mock.patch.object(
+            w, "fetch_gerrit_cl_status", side_effect=lambda t, *a, **k: dict(cl_infos[str(t)])
+        ),
+        mock.patch.object(w, "fetch_gerrit_related_cl_ids", return_value=[]),
+        mock.patch.object(w, "fetch_gerrit_stack_order_ids", side_effect=lambda h, t: [t]),
+        mock.patch.object(w, "fetch_gerrit_companion_threads", return_value={}),
+        mock.patch.object(w, "fetch_gmail_status_for_id", return_value={"thread_ids": []}),
+        mock.patch.object(w, "_get_gerrit_bearer_token", return_value="tok"),
+        mock.patch.object(w.urllib.request, "urlopen", side_effect=fake_urlopen),
+        mock.patch.object(w, "overlay_live_chat_busy"),
+    ]
+    with contextlib.ExitStack() as stack:
+      for p in patches:
+        stack.enter_context(p)
+      out_state = w.sync_once(
+          wake_chats=True, update_titles=False, skia_dir="/nonexistent"
+      )
+
+    self.assertEqual(abandoned_urls, [])
+    rec_standalone = out_state["items"]["gerrit:1421862@unchatted"]
+    self.assertEqual(rec_standalone["status"], "NEW")
+    self.assertNotIn("companion_to", rec_standalone)
+    self.assertFalse(rec_standalone.get("is_companion", False))
+    self.assertEqual(rec_standalone["assigned_reviewers_count"], 2)
+
+    for explicit_tid in ("1421898", "1421899"):
+      rec_explicit = out_state["items"][f"gerrit:{explicit_tid}@unchatted"]
+      self.assertEqual(rec_explicit["status"], "NEW")
+      self.assertEqual(rec_explicit["companion_to"], "gerrit:1418836")
+      self.assertTrue(rec_explicit["ready_to_abandon"])
+      self.assertFalse(rec_explicit["auto_abandon_eligible"])
+
+  # Checks that GitHub-style "for #N" references in a Gerrit commit message are not
+  # companion markers, so a standalone Gerrit CL citing a Flutter issue stays standalone
+  def test_github_pr_ref_is_not_a_gerrit_companion_marker(self):
+    gerrit_rec = {
+        "item_key": "gerrit:1421862",
+        "kind": "gerrit",
+        "host": w.GERRIT_SKIA_HOST,
+        "is_wip": False,
+        "is_draft": False,
+        "in_development": False,
+        "commit_message": "Add regression test for #187181",
+    }
+    self.assertTrue(
+        w._is_standalone_non_companion_self_cl(gerrit_rec, "[skparagraph] Fix x")
+    )
+    github_rec = {
+        "item_key": "github:200001",
+        "kind": "github",
+        "head_ref": "fix-x",
+        "commit_message": "Companion for #187181",
+    }
+    self.assertTrue(w._has_explicit_companion_marker(github_rec, "Fix x"))
+    github_cl_ref = {**github_rec, "commit_message": "Companion for CL 1418836"}
+    self.assertFalse(w._has_explicit_companion_marker(github_cl_ref, "Fix x"))
+
+  # Checks that a self stack inherits the parent self CL's chat even though chat
+  # discovery records lack is_self, and that a %wip Part 2 is not tagged as its companion
+  def test_self_stack_chat_inheritance_reads_is_self_from_state(self):
+    fake_chats = [{
+        "item_key": "gerrit:1421950",
+        "conversation_id": "c-self-1421950",
+        "chat_archived": False,
+        "single_target": True,
+    }]
+    state_items = {
+        "gerrit:1421950@c-self-1421950": {
+            "item_key": "gerrit:1421950",
+            "is_self": True,
+        },
+    }
+    base_rec = {
+        "item_key": "gerrit:1421951",
+        "kind": "gerrit",
+        "host": w.GERRIT_SKIA_HOST,
+        "is_self": True,
+        "is_draft": False,
+        "subject": "[skparagraph] Part 2",
+    }
+    for is_wip, in_dev in ((False, False), (True, True)):
+      rec = {**base_rec, "is_wip": is_wip, "in_development": in_dev}
+      with mock.patch.object(
+          w, "discover_active_cl_chats", return_value=fake_chats
+      ), mock.patch.object(
+          w, "fetch_gerrit_related_cl_ids", return_value=["1421951", "1421950"]
+      ):
+        got = w._discover_existing_chat_for_item(
+            "gerrit:1421951", rec, state_items
+        )
+      self.assertEqual(got, ("c-self-1421950", False, ""), msg=f"is_wip={is_wip}")
+
+  # Checks that a %wip CL stacked on a standalone self CL never crosses it to attach
+  # as a companion of an older external ancestor, via parent_commit and related IDs
+  def test_wip_on_standalone_self_does_not_cross_to_external_ancestor(self):
+    host = w.GERRIT_SKIA_HOST
+    ext = {
+        "is_self": False,
+        "status": "NEW",
+        "subject": "[skparagraph] External change",
+        "revision_ps_by_sha": {"sha_ext_961": 1},
+        "parent_commit": "sha_main",
+    }
+    standalone = {
+        "is_self": True,
+        "is_wip": False,
+        "is_draft": False,
+        "in_development": False,
+        "status": "NEW",
+        "subject": "[skparagraph] Part 1",
+        "revision_ps_by_sha": {"sha_self_962": 4},
+        "parent_commit": "sha_ext_961",
+    }
+    tip = {
+        "is_self": True,
+        "is_wip": True,
+        "is_draft": True,
+        "in_development": True,
+        "status": "NEW",
+        "subject": "[skparagraph] Part 2",
+        "revision_ps_by_sha": {"sha_tip_963": 1},
+        "parent_commit": "sha_self_962",
+    }
+    cache = {"gerrit:1421961": ext, "gerrit:1421962": standalone, "gerrit:1421963": tip}
+    related = ["1421963", "1421962", "1421961"]
+    got = w._resolve_gerrit_stack_companion_parent(
+        host, "1421963", tip["subject"], tip, cache, related
+    )
+    self.assertEqual(got, ("", 0))
+    comp_subj = "[skparagraph] Companion for Part 1"
+    got = w._resolve_gerrit_stack_companion_parent(
+        host, "1421963", comp_subj, {**tip, "subject": comp_subj}, cache, related
+    )
+    self.assertEqual(got, ("gerrit:1421962", 4))
+
+    no_pc = {k: v for k, v in tip.items() if k != "parent_commit"}
+    got = w._resolve_gerrit_stack_companion_parent(
+        host, "1421963", tip["subject"], no_pc, cache, related
+    )
+    self.assertEqual(got, ("", 0))
+
+  # Checks the HTTP abandon sink itself refuses unattended abandon of approved or
+  # non-WIP companions, independent of upstream eligibility flags
+  def test_auto_abandon_sink_skips_approved_or_non_wip_companions(self):
+    def make_rec(tid: str, **kw):
+      return {
+          "item_key": f"gerrit:{tid}",
+          "target_id": tid,
+          "kind": "gerrit",
+          "host": w.GERRIT_SKIA_HOST,
+          "is_self": True,
+          "status": "NEW",
+          "subject": f"[skparagraph] Companion for CL {tid}",
+          "companion_to": "gerrit:1418836",
+          "ready_to_abandon": True,
+          "auto_abandon_eligible": True,
+          **kw,
+      }
+
+    state = {
+        "items": {
+            "gerrit:1421971@unchatted": make_rec("1421971", is_wip=False),
+            "gerrit:1421972@unchatted": make_rec(
+                "1421972", is_wip=True, approved_count=1
+            ),
+        },
+        "events": [],
+    }
+    with mock.patch.object(
+        w, "_get_gerrit_bearer_token", return_value="tok"
+    ), mock.patch.object(w.urllib.request, "urlopen") as urlopen:
+      w.abandon_companion_items(
+          ["gerrit:1421971", "gerrit:1421972"], state=state, auto=True
+      )
+    urlopen.assert_not_called()
 
 
 if __name__ == "__main__":

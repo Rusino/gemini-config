@@ -1704,6 +1704,78 @@ def fetch_gerrit_stack_order_ids(host: str, cl_id: str) -> list[str]:
   return _RELATED_STACK_ORDER_CACHE.get(cache_key, [str(cl_id)])
 
 
+def _has_explicit_companion_marker(
+    item: dict[str, Any] | None, subj: str = ""
+) -> bool:
+  """Returns True if `item` or `subj` explicitly marks a review companion CL/PR.
+
+  Checks `subject`/`title`, `commit_message`, and `head_ref`/`head_ref_name`
+  without mutating `item`.
+  """
+  rec = item or {}
+  eff_subj = str(subj or rec.get("subject") or rec.get("title") or "")
+  # Explicit companion word in subject or title overrides non-WIP heuristics
+  if "companion" in eff_subj.lower():
+    return True
+  cmsg = str(rec.get("commit_message") or "")
+  head_ref = str(rec.get("head_ref") or rec.get("head_ref_name") or "")
+  # Match only the host's own ref syntax: "for #N" in a Gerrit message cites an issue
+  is_github = (
+      rec.get("kind") == "github"
+      or str(rec.get("item_key") or "").startswith("github:")
+      or "github.com" in str(rec.get("host") or "")
+      or "head_ref" in rec
+      or "head_ref_name" in rec
+  )
+  if not is_github:
+    return bool(RE_COMPANION_CL_REF.search(eff_subj) or RE_COMPANION_CL_REF.search(cmsg))
+  if RE_COMPANION_PR_REF.search(eff_subj) or RE_COMPANION_PR_REF.search(cmsg):
+    return True
+  # GitHub companion branches carry parent PR provenance even when the title is generic
+  return bool(head_ref and RE_COMPANION_BRANCH.match(head_ref))
+
+
+def _is_standalone_non_companion_self_cl(
+    item: dict[str, Any] | None, subj: str = ""
+) -> bool:
+  """Returns True if a self change lacks companion markers and is not WIP/draft.
+
+  Reads `item` and optional `subj` without side effects; treats `[SkoreText]`
+  subjects and fetched non-WIP/non-draft records as standalone changes.
+  Unmarked %wip CLs on an external CL stay silent companions (companion-cl-review).
+  """
+  rec = item or {}
+  eff_subj = str(subj or rec.get("subject") or rec.get("title") or "")
+  if _has_explicit_companion_marker(rec, eff_subj):
+    return False
+  # SkoreText feature CLs are never temporary review companions for external changes
+  if eff_subj.lstrip().startswith("[SkoreText]"):
+    return True
+  if RE_DRAFT_SUBJECT.match(eff_subj):
+    return False
+  if rec.get("is_wip") or rec.get("is_draft"):
+    return False
+  # Silent stack companions are always %wip; non-WIP fetched changes are standalone
+  return any(k in rec for k in ("is_wip", "is_draft", "in_development"))
+
+
+def _is_auto_abandon_safe_companion(item: dict[str, Any] | None) -> bool:
+  """Returns True if `item` is safe for unattended companion auto-abandonment.
+
+  Requires zero external approvals (`approved_count == 0`) and an active WIP/draft
+  state (`is_wip`, `is_draft`, or `RE_DRAFT_SUBJECT`); fails closed when WIP
+  fields are missing. Pure read with no side effects.
+  """
+  rec = item or {}
+  # Never unattendedly abandon a change that already received a reviewer approval
+  if int(rec.get("approved_count") or 0) > 0:
+    return False
+  eff_subj = str(rec.get("subject") or rec.get("title") or "")
+  return bool(
+      rec.get("is_wip") or rec.get("is_draft") or RE_DRAFT_SUBJECT.match(eff_subj)
+  )
+
+
 def _resolve_gerrit_stack_companion_parent(
     host: str,
     tid: str,
@@ -1713,28 +1785,20 @@ def _resolve_gerrit_stack_companion_parent(
     related_ids: Iterable[str],
 ) -> tuple[str, int]:
   """Resolves the direct non-self parent change key and base PS for a stacked self CL."""
-  # A non-WIP self CL already sent out to reviewers without companion markers is standalone
-  if (
-      "in_development" in info
-      and not info.get("is_wip")
-      and not info.get("is_draft")
-      and not info.get("in_development")
-      and "companion" not in subj.lower()
-  ):
-    return "", 0
-  # SkoreText feature CLs are never temporary review companions for external changes
-  if subj.lstrip().startswith("[SkoreText]") and "companion" not in subj.lower():
+  if _is_standalone_non_companion_self_cl(info, subj):
     return "", 0
 
   has_companion_kw = "companion" in subj.lower()
-  # Index commit SHAs -> (change_num, is_self, is_comp_subj, base_ps, parent_sha)
-  sha_to_entry: dict[str, tuple[str, bool, bool, int, str]] = {}
+  # Index commit SHAs -> (change_num, is_self, is_comp_subj, base_ps, parent_sha,
+  # is_standalone_self)
+  sha_to_entry: dict[str, tuple[str, bool, bool, int, str, bool]] = {}
   for fk, finfo in fetched_cache.items():
     if not fk.startswith("gerrit:") or not isinstance(finfo, dict):
       continue
     fnum = fk.split(":", 1)[1]
     fis_self = bool(finfo.get("is_self", False))
     fis_comp = "companion" in str(finfo.get("subject") or "").lower()
+    fis_alone = fis_self and _is_standalone_non_companion_self_cl(finfo)
     fpsha = str(finfo.get("parent_commit") or "").strip()
     f_merged = str(finfo.get("status") or "").upper() == "MERGED"
     revs = finfo.get("revision_ps_by_sha") or {}
@@ -1742,7 +1806,9 @@ def _resolve_gerrit_stack_companion_parent(
     last_ps = max((int(ps or 0) for ps in revs.values()), default=0) if f_merged else 0
     for rsha, rps in revs.items():
       if rsha and not (f_merged and int(rps or 0) == last_ps):
-        sha_to_entry[str(rsha)] = (fnum, fis_self, fis_comp, int(rps or 0), fpsha)
+        sha_to_entry[str(rsha)] = (
+            fnum, fis_self, fis_comp, int(rps or 0), fpsha, fis_alone
+        )
 
   start_parent_sha = str(info.get("parent_commit") or "").strip()
   self_emails_lc = {e.lower() for e in SELF_EMAILS}
@@ -1773,6 +1839,11 @@ def _resolve_gerrit_stack_companion_parent(
         or ""
     )
     cis_comp = "companion" in csubj.lower()
+    cis_alone = (
+        cis_self
+        and isinstance(f_override, dict)
+        and _is_standalone_non_companion_self_cl(f_override, csubj)
+    )
     rev_num = int(ch.get("_revision_number") or 0)
     c_status = str(
         (f_override.get("status") if isinstance(f_override, dict) else None)
@@ -1784,7 +1855,7 @@ def _resolve_gerrit_stack_companion_parent(
     if c_status == "MERGED" and rev_num == cur_rev_num:
       continue
     if csha and csha not in sha_to_entry:
-      sha_to_entry[csha] = (cnum, cis_self, cis_comp, rev_num, psha)
+      sha_to_entry[csha] = (cnum, cis_self, cis_comp, rev_num, psha, cis_alone)
     if cnum == tid and not start_parent_sha and psha:
       start_parent_sha = psha
 
@@ -1797,11 +1868,16 @@ def _resolve_gerrit_stack_companion_parent(
       if not cur_sha or cur_sha in visited or cur_sha not in sha_to_entry:
         break
       visited.add(cur_sha)
-      cnum, cis_self, cis_comp, rev_num, next_psha = sha_to_entry[cur_sha]
+      cnum, cis_self, cis_comp, rev_num, next_psha, cis_alone = sha_to_entry[cur_sha]
       if cnum == tid:
         break
       if not cis_self:
         return f"gerrit:{cnum}", rev_num
+      # A standalone self CL owns everything stacked on it; never cross it to its ancestors
+      if cis_alone:
+        if has_companion_kw and not self_fallback[0]:
+          return f"gerrit:{cnum}", rev_num
+        break
       # Record non-companion self parent only as fallback when no external ancestor exists
       if has_companion_kw and not cis_comp and not self_fallback[0]:
         self_fallback = (f"gerrit:{cnum}", rev_num)
@@ -1817,6 +1893,9 @@ def _resolve_gerrit_stack_companion_parent(
     rel_info = fetched_cache.get(cand_key) or {}
     if not bool(rel_info.get("is_self", False)):
       return cand_key, 0
+    # Related IDs run tip-to-base, so a standalone self CL hides older ancestors
+    if _is_standalone_non_companion_self_cl(rel_info):
+      return (self_rel_fallback or cand_key, 0) if has_companion_kw else ("", 0)
     if (
         has_companion_kw
         and not self_rel_fallback
@@ -6955,9 +7034,15 @@ def _lookup_state_item(
 
 
 def _discover_existing_chat_for_item(
-    ikey: str, rec: dict[str, Any] | None
+    ikey: str,
+    rec: dict[str, Any] | None,
+    state_items: dict[str, Any] | None = None,
 ) -> tuple[str, bool, str]:
-  """Searches active, companion-parent, and archived chats for `ikey`."""
+  """Searches active, companion-parent, and archived chats for `ikey`.
+
+  `state_items` supplies the watcher record of a parent chat's CL, since chat
+  discovery records carry no `is_self`; read-only.
+  """
   by_key = {
       c["item_key"]: c
       for c in discover_active_cl_chats(include_archived=True)
@@ -6973,8 +7058,9 @@ def _discover_existing_chat_for_item(
       True if not rec or "is_self" not in rec else bool(rec.get("is_self"))
   )
   is_companion_ref = False
+  standalone_self = rec_is_self and _is_standalone_non_companion_self_cl(rec)
   known_comp_to = str((rec or {}).get("companion_to") or "").strip()
-  if by_key and known_comp_to and rec_is_self:
+  if by_key and known_comp_to and rec_is_self and not standalone_self:
     parent_keys = [known_comp_to]
     is_companion_ref = True
   elif by_key and ikey.startswith("gerrit:"):
@@ -7010,8 +7096,13 @@ def _discover_existing_chat_for_item(
   for parent_key in parent_keys:
     parent = by_key.get(parent_key)
     if parent:
-      parent_is_self = bool(parent.get("is_self", False))
-      is_cand_comp = rec_is_self and (not parent_is_self or is_companion_ref)
+      p_rec = parent
+      if "is_self" not in parent and state_items:
+        p_rec = _lookup_state_item(state_items, parent_key)[1] or parent
+      parent_is_self = bool(p_rec.get("is_self", False))
+      is_cand_comp = rec_is_self and (
+          is_companion_ref or (not parent_is_self and not standalone_self)
+      )
       can_inherit_stack_chat = (
           is_cand_comp
           or (rec_is_self and parent_is_self)
@@ -7273,7 +7364,9 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
   triage_dir = _triage_results_dir()
 
   # Reuse an existing active, companion-parent, or archived chat before spawning a new one
-  existing_cid, is_arch, comp_to = _discover_existing_chat_for_item(ikey, rec)
+  existing_cid, is_arch, comp_to = _discover_existing_chat_for_item(
+      ikey, rec, items
+  )
   active_cid = existing_cid or (
       str(rec.get("conversation_id") or "").strip() if isinstance(rec, dict) else ""
   )
@@ -7626,7 +7719,9 @@ def rebase_item(item_key: str) -> dict[str, Any]:
   is_arch: bool | None = None
   comp_to = ""
   if not cid:
-    disc_cid, disc_arch, comp_to = _discover_existing_chat_for_item(ikey, rec)
+    disc_cid, disc_arch, comp_to = _discover_existing_chat_for_item(
+        ikey, rec, items
+    )
     if disc_cid:
       cid = disc_cid
       is_arch = True if disc_arch else False
@@ -7789,7 +7884,9 @@ def diagnose_checks_item(item_key: str) -> dict[str, Any]:
   is_arch: bool | None = None
   comp_to = ""
   if not cid:
-    disc_cid, disc_arch, comp_to = _discover_existing_chat_for_item(ikey, rec)
+    disc_cid, disc_arch, comp_to = _discover_existing_chat_for_item(
+        ikey, rec, items
+    )
     if disc_cid:
       cid = disc_cid
       is_arch = True if disc_arch else False
@@ -8087,6 +8184,9 @@ def abandon_companion_items(
       errors.append(f"{ikey}: cannot abandon external author's change")
       continue
     if auto and str(rec.get("status") or "").upper() not in ("NEW", "OPEN"):
+      continue
+    # Guard the HTTP sink itself so no upstream flag can abandon a reviewed change
+    if auto and not _is_auto_abandon_safe_companion(rec):
       continue
 
     kind = str(rec.get("kind") or "")
@@ -8431,6 +8531,9 @@ def compute_companion_states(
   for rec in new_items.values():
     if not isinstance(rec, dict) or not rec.get("companion_to"):
       continue
+    # Preserve WIP provenance before zeroing is_draft for Flight Deck lane suppression
+    if rec.get("is_draft") and "is_wip" not in rec:
+      rec["is_wip"] = True
     rec["is_companion"] = True
     rec["merge_conflict"] = False
     rec["missing_reviewers_to_assign"] = 0
@@ -8593,7 +8696,9 @@ def compute_companion_states(
         r["companion_thread_resolved"] = all_resolved
         r["ready_to_abandon"] = bool(reason)
         r["ready_to_abandon_reason"] = reason
-        r["auto_abandon_eligible"] = auto_eligible
+        r["auto_abandon_eligible"] = (
+            auto_eligible and _is_auto_abandon_safe_companion(r)
+        )
 
     # Deduplicate parallel open companion chains while keeping stacked A -> B companions intact
     if len(open_comps_by_ikey) > 1:
@@ -8641,7 +8746,7 @@ def compute_companion_states(
               r["companion_duplicate"] = True
               r["companion_superseded_by"] = can_label
               r["ready_to_abandon"] = True
-              r["auto_abandon_eligible"] = True
+              r["auto_abandon_eligible"] = _is_auto_abandon_safe_companion(r)
               if not r.get("ready_to_abandon_reason"):
                 r["ready_to_abandon_reason"] = (
                     f"Duplicate companion (superseded by {can_label})"
@@ -14195,6 +14300,10 @@ def _sync_once_locked(
     info = fetched_cache.get(ikey) or {}
     if not info.get("is_self"):
       continue
+    d_subj = str(info.get("subject") or d.get("title") or "")
+    # A CL sent out for review drops companion_to it carried while still unreviewed
+    if _is_standalone_non_companion_self_cl(info, d_subj):
+      continue
     _, prev_d = _lookup_state_item(prev_items, ikey)
     prev_comp_to = str((prev_d or {}).get("companion_to") or "").strip()
     if not prev_comp_to:
@@ -14264,13 +14373,6 @@ def _sync_once_locked(
   for d in active_discovered:
     comp_to = str(d.get("companion_to") or "").strip()
     if not comp_to.startswith("gerrit:"):
-      continue
-    d_info = fetched_cache.get(str(d.get("item_key") or "")) or {}
-    d_subj = str(d_info.get("subject") or d.get("title") or "").lstrip()
-    # Drop stale companion links on SkoreText feature CLs that lack explicit companion markers
-    if d_subj.startswith("[SkoreText]") and "companion" not in d_subj.lower():
-      for k in ("companion_to", "is_companion", "companion_base_ps_hint"):
-        d.pop(k, None)
       continue
     p_info = fetched_cache.get(comp_to) or {}
     if str(p_info.get("status") or "").upper() != "MERGED":
