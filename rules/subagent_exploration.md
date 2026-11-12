@@ -11,8 +11,9 @@ description: "Context hygiene: when to delegate to subagents, which model, and g
 - Models: `Model="flash"` for mechanical lookups (`scout`), test/build runners, log triage and
   routine `keeper_skeptic` batches; `Model="inherit"` for semantic research, root-cause work and
   `keeper_inquisitor`. Never `Model="pro"` (hook-enforced)
-- Give a subagent at most 150 KB or 10 files per turn; never dump whole `references/`, `g3doc/`
-  or module trees into one subagent
+- Give a subagent at most 150 KB or 10 files per turn (never dump whole `references/`, `g3doc/`
+  or module trees); keep static instructions/rubrics at the prompt prefix and dynamic per-turn
+  payloads at the tail for KV cache stability
 - Running test orchestrators, roll triage, or reading their logs: see `test_runs.md`
 - Never defer to a broken local pattern just because existing code or a comment codifies it;
   judge against `cpp_systems_invariants.md`, `text_domain_invariants.md`, `code_style.md`

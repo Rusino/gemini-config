@@ -813,6 +813,47 @@ def check_rule_skill_hygiene(
                                 f"but registered server `{expected_srv}` is missing from "
                                 "`rules/subagent_exploration.md`"
                             )
+
+    # Guard KV prompt-cache prefix stability in always_on rules and subagent Prompt templates
+    if re.search(r"(?m)^trigger:\s*always_on\s*$", text[:400]):
+        for m_dyn in re.finditer(
+            r"\$\(date\b|`date\b|<current_time>|\{\{\s*(?:TIMESTAMP|NOW|DATE)\s*\}\}",
+            text,
+            re.IGNORECASE,
+        ):
+            line_no = text.count("\n", 0, m_dyn.start()) + 1
+            warnings.append(
+                f"Line {line_no}: `always_on` rule contains dynamic timestamp token "
+                f"`{m_dyn.group(0)}` (violates KV prompt-cache prefix stability)"
+            )
+    for m_prompt in re.finditer(r'Prompt="""(.*?)"""', text, re.DOTALL):
+        prompt_body = m_prompt.group(1)
+        prompt_line = text.count("\n", 0, m_prompt.start()) + 1
+        tail_idx = prompt_body.find("Invocation Payload")
+        prefix_slice = prompt_body[:tail_idx] if tail_idx >= 0 else prompt_body
+        for dyn_marker in (
+            "Intended Task Goal & Original User Constraints",
+            "Prior Refuted Findings",
+            "Target Document / Text:",
+            "Target Repositories / Codebases:",
+            "Candidates Under Test",
+            "<stage0_dir>",
+            "<repo_path>",
+            "<repo_root>",
+            "<path_to_draft>",
+            "<repo_paths>",
+        ):
+            if dyn_marker in prefix_slice and (
+                "Instructions:" in prompt_body
+                or "Output Format" in prompt_body
+                or "Three Iron Verification Principles" in prompt_body
+            ):
+                warnings.append(
+                    f"Line {prompt_line}: Subagent `Prompt` template places dynamic payload "
+                    f"`{dyn_marker}` before `Invocation Payload` tail (move dynamic per-turn "
+                    "inputs to the prompt tail for KV cache prefix stability)"
+                )
+                break
     return warnings
 
 

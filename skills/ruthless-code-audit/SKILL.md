@@ -122,8 +122,12 @@ invoke_subagent(
     Model="<flash or inherit per keeper_skeptic.md XFAMILY_REFUTE rules>",
     Workspace="inherit",
     Prompt="""
-You are the Verification Skeptic (`keeper_skeptic`) auditing candidate findings in `<repo_root>`.
+You are the Verification Skeptic (`keeper_skeptic`) auditing candidate findings.
 Refute each candidate below using real code, callers (`git grep`, `grep -rn`, `code_search`), templates, build files, comments, and unit tests per your Three Iron Verification Principles. End your report with `COMPACTION: YES` or `COMPACTION: NO` depending on whether `<CONTEXT_SUMMARY>` appeared in your context.
+
+---
+Invocation Payload (Dynamic Per-Turn Tail — Keep Below Static Instructions for KV Cache Prefix Stability):
+- `repo_root`: `<repo_root>`
 
 Candidates Under Test (Batch V001):
 <paste all candidate HIGH/CRITICAL bugs (B1, B2...) and all candidate DELETE / non-trivial SIMPLIFY items (D1, D2...)>

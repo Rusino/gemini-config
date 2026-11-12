@@ -55,6 +55,17 @@ GENERATED_BASENAMES = frozenset({
     "fieldtrial_testing_config.json", "enums.xml",
 })
 CPP_IMPL_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".mm"})
+MAX_HISTORY_RAG_COMMITS = 80
+MAX_HISTORY_RAG_COMMIT_FILES = 12
+MAX_HISTORY_RAG_SIBLINGS = 5
+NON_PROD_DIRS = frozenset({
+    "test", "tests", "testing", "bench", "benchmarks", "fuzz",
+    "doc", "docs", "g3doc", "examples", "slides",
+})
+DOC_EXTENSIONS = frozenset({".md", ".rst", ".txt", ".adoc", ".html"})
+TEST_BASENAME_RE = re.compile(
+    r"^(?:test_.*|.*(?:_test|_tests|_unittest|Test|Tests|\.spec|\.test)\.[A-Za-z0-9]+)$"
+)
 
 
 def _run_git(cwd: Path, args: list[str], timeout: float = 10.0) -> tuple[int, str]:
@@ -186,6 +197,105 @@ def _companion_headers(rel_path: str) -> list[str]:
     if inc_path not in cands:
       cands.append(inc_path)
   return cands
+
+
+def _is_excluded_comod_path(rel_path: str) -> bool:
+  """Returns True for tests, docs, binaries, or lockfiles excluded from History-RAG siblings."""
+  if _is_skippable_path(rel_path):
+    return True
+  p = Path(rel_path)
+  if p.suffix.lower() in DOC_EXTENSIONS:
+    return True
+  if TEST_BASENAME_RE.match(p.name):
+    return True
+  return any(seg.lower() in NON_PROD_DIRS for seg in p.parts[:-1])
+
+
+def _compute_comodified_siblings(
+    repo_root: Path | None,
+    changed_paths: list[str],
+    max_commits: int = MAX_HISTORY_RAG_COMMITS,
+    max_commit_files: int = MAX_HISTORY_RAG_COMMIT_FILES,
+    top_k: int = MAX_HISTORY_RAG_SIBLINGS,
+) -> list[dict]:
+  """Ranks untouched production files most frequently co-modified in git log with changed_paths.
+
+  Filters out mega-commits (> max_commit_files), mechanical rename/copy commits,
+  test directories/files, and documentation files so review shards focus on
+  tightly coupled production counterparts.
+  """
+  if repo_root is None or not changed_paths:
+    return []
+  seeds = [p for p in changed_paths if not _is_excluded_comod_path(p)][:15]
+  if not seeds:
+    return []
+
+  rc, out = _run_git(
+      repo_root,
+      [
+          "log",
+          "--no-merges",
+          f"-n{max_commits}",
+          "--full-diff",
+          "--name-status",
+          "--format=COMMIT:%h",
+          "--",
+          *seeds,
+      ],
+      timeout=12.0,
+  )
+  if rc != 0 or not out.strip():
+    return []
+
+  changed_set = set(changed_paths)
+  seed_set = set(seeds)
+  co_counts: dict[str, int] = {}
+  paired_with: dict[str, set[str]] = {}
+
+  commits: list[list[tuple[str, str]]] = []
+  cur_entries: list[tuple[str, str]] = []
+  for raw in out.splitlines():
+    line = raw.strip()
+    if not line:
+      continue
+    if line.startswith("COMMIT:"):
+      if cur_entries:
+        commits.append(cur_entries)
+        cur_entries = []
+      continue
+    parts = line.split("\t")
+    if len(parts) >= 2:
+      cur_entries.append((parts[0].strip(), parts[-1].strip()))
+  if cur_entries:
+    commits.append(cur_entries)
+
+  for entries in commits:
+    # Skip mega-commits and mechanical tree-wide rename/copy commits
+    if len(entries) > max_commit_files:
+      continue
+    if any(status.startswith(("R", "C")) for status, _ in entries):
+      continue
+    paths_in_commit = [path for status, path in entries if status == "M"]
+    touched_seeds = [p for p in paths_in_commit if p in seed_set]
+    if not touched_seeds:
+      continue
+    for cand in paths_in_commit:
+      if cand in changed_set or _is_excluded_comod_path(cand):
+        continue
+      if not (repo_root / cand).is_file():
+        continue
+      co_counts[cand] = co_counts.get(cand, 0) + 1
+      paired_with.setdefault(cand, set()).update(touched_seeds)
+
+  ranked = sorted(co_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
+  return [
+      {
+          "path": cand,
+          "co_commits": count,
+          "paired_with": sorted(paired_with.get(cand, ())),
+      }
+      for cand, count in ranked
+  ]
 
 
 def _number_lines(raw_text: str) -> str:
@@ -619,6 +729,7 @@ def _render_context_md(
     skipped: list[dict[str, str]],
     ledger_md: str,
     constraints: list[str],
+    history_siblings: list[dict] | None = None,
 ) -> str:
   """Formats <out_dir>/context.md for Turn 1 parallel ingestion by audit shards."""
   repo_root = source.get("repo_root")
@@ -635,6 +746,11 @@ def _render_context_md(
   skip_lines = [
       f"- `{item['path']}` ({item['reason']})" for item in skipped
   ] or ["- (none)"]
+  sibling_lines = [
+      f"- `{item['path']}` (co-modified in {item['co_commits']} recent commit(s) "
+      f"with {', '.join(f'`{p}`' for p in item['paired_with'])})"
+      for item in (history_siblings or [])
+  ] or ["- (none detected)"]
   constraint_lines = [
       f"{idx}. {c}" for idx, c in enumerate(constraints, 1)
   ] or ["(No transcript provided or 0 USER_INPUT turns found)"]
@@ -660,6 +776,9 @@ def _render_context_md(
 
 ## 2. Modified File Inventory
 {chr(10).join(file_stats) if file_stats else '- (empty diff)'}
+
+### History-RAG Co-Modified Production Siblings (Untouched in Diff)
+{chr(10).join(sibling_lines)}
 
 ### Skipped Binary / Generated / Deleted Files
 {chr(10).join(skip_lines)}
@@ -729,7 +848,7 @@ def stage_context(
   constraints = _extract_transcript_constraints(transcript)
 
   if source["status"].upper() == "ABANDONED":
-    staged_index, skipped = [], []
+    staged_index, skipped, history_siblings = [], [], []
     (out_dir / "files_bundle.md").write_text(
         "# Post-Patch Files Skipped (CL ABANDONED)\n", encoding="utf-8"
     )
@@ -737,13 +856,14 @@ def stage_context(
     staged_index, skipped = _stage_files_bundle(
         out_dir, changed_paths, deleted_paths, binary_paths, diff_ranges, source["fetch_file"]
     )
+    history_siblings = _compute_comodified_siblings(source.get("repo_root"), changed_paths)
 
   topology, shards = _classify_shard_topology(
       changed_paths, insertions, deletions, source["status"]
   )
   context_md = _render_context_md(
       source, out_dir, file_stats, insertions, deletions, topology,
-      shards, staged_index, skipped, ledger_md, constraints,
+      shards, staged_index, skipped, ledger_md, constraints, history_siblings,
   )
   (out_dir / "context.md").write_text(context_md, encoding="utf-8")
 
@@ -757,6 +877,7 @@ def stage_context(
       "open_threads_count": source["open_threads_count"],
       "prior_refutations_count": len(ledger_entries),
       "user_constraints_count": len(constraints),
+      "history_rag_siblings": history_siblings,
       "recommended_topology": topology, "recommended_shards": shards,
       "out_dir": str(out_dir),
       "artifacts": {

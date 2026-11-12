@@ -132,13 +132,16 @@ def notice(data: dict, now: float) -> dict:
   _write_json(state_path, {"owner": conv, "quiet_until": now + NOTICE_INTERVAL_S})
   where = "this chat" if marker.get("conv") == conv else f"chat {marker.get('conv') or '?'}"
   when = time.strftime("%H:%MZ", time.gmtime(marker["ts"]))
+  # Keep static remediation header at the message prefix and dynamic timestamp/error at the tail
+  # so KV prompt-cache prefixes remain stable across repeated notices
   return {"injectSteps": [{"ephemeralMessage": (
-      f"[PRE-TOOL GUARD FAILED OPEN] At {when} hooks/pre_tool_guard.py raised "
-      f"{marker.get('error', '?')} ({marker.get('where', '?')}) on a gated tool call in {where} "
-      "and allowed it without running its guards. Until it is fixed, run_command and file edits "
-      "may run unguarded: tell the user. To repair it, edit a copy of the file and mv it into "
-      "place (see the comment at its top), then run `python3 tests/run_all_tests.py` in "
-      "~/.gemini/config."
+      "[PRE-TOOL GUARD FAILED OPEN] hooks/pre_tool_guard.py raised an unhandled exception "
+      "on a gated tool call and allowed it without running its guards. Until it is fixed, "
+      "run_command and file edits may run unguarded: tell the user. To repair it, edit a "
+      "copy of the file and mv it into place (see the comment at its top), then run "
+      "`python3 tests/run_all_tests.py` in ~/.gemini/config. "
+      f"(Failure telemetry: at {when} in {where} — {marker.get('error', '?')} "
+      f"({marker.get('where', '?')}))"
   )}]}
 
 

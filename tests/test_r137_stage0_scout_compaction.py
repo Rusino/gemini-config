@@ -123,6 +123,76 @@ class TestR137Stage0ScoutCompaction(unittest.TestCase):
       self.assertIn("Keep ABI frozen No extra deps", ctx_md)
       self.assertIn("Missing null check", ctx_md)
 
+  # Verifies R143 History-RAG ranks co-modified production files while filtering tests, docs,
+  # mechanical renames, and mega-commits
+  def test_history_rag_comodified_siblings_ranks_and_filters(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      repo = Path(tmp) / "repo"
+      repo.mkdir()
+      self._git(repo, "init", "-b", "main")
+      self._git(repo, "config", "user.email", "test@example.com")
+      self._git(repo, "config", "user.name", "Tester")
+
+      src = repo / "src"
+      tests = repo / "tests"
+      docs = repo / "docs"
+      src.mkdir()
+      tests.mkdir()
+      docs.mkdir()
+
+      for name in ("layout.cpp", "run.cpp", "caret.cpp", "paint.cpp"):
+        (src / name).write_text("int v = 0;\n", encoding="utf-8")
+      (tests / "layout_test.cpp").write_text("int t = 0;\n", encoding="utf-8")
+      (docs / "guide.md").write_text("# Guide\n", encoding="utf-8")
+      self._git(repo, "add", ".")
+      self._git(repo, "commit", "-m", "Initial")
+
+      # Commit 1 & 2: layout.cpp co-modified with run.cpp, test, and doc
+      for idx in (1, 2):
+        (src / "layout.cpp").write_text(f"int v = {idx};\n", encoding="utf-8")
+        (src / "run.cpp").write_text(f"int v = {idx};\n", encoding="utf-8")
+        (tests / "layout_test.cpp").write_text(f"int t = {idx};\n", encoding="utf-8")
+        (docs / "guide.md").write_text(f"# Guide {idx}\n", encoding="utf-8")
+        self._git(repo, "add", ".")
+        self._git(repo, "commit", "-m", f"Co-mod run {idx}")
+
+      # Commit 3: layout.cpp co-modified with caret.cpp once
+      (src / "layout.cpp").write_text("int v = 3;\n", encoding="utf-8")
+      (src / "caret.cpp").write_text("int v = 3;\n", encoding="utf-8")
+      self._git(repo, "add", ".")
+      self._git(repo, "commit", "-m", "Co-mod caret")
+
+      # Commit 4: mega-commit touching >12 files (must be filtered out)
+      (src / "layout.cpp").write_text("int v = 4;\n", encoding="utf-8")
+      (src / "paint.cpp").write_text("int v = 4;\n", encoding="utf-8")
+      for i in range(13):
+        (src / f"bulk_{i}.cpp").write_text(f"int b = {i};\n", encoding="utf-8")
+      self._git(repo, "add", ".")
+      self._git(repo, "commit", "-m", "Mega tree-wide formatting")
+
+      # Dirty worktree modifying only src/layout.cpp
+      (src / "layout.cpp").write_text("int v = 5;\n", encoding="utf-8")
+      out_dir = Path(tmp) / "stage0"
+      with patch.dict(os.environ, {"JETSKI_LEDGER_DIR": str(Path(tmp) / "ledgers")}):
+        summary = stage_diff_context.stage_context(
+            out_dir=out_dir, repo=str(repo), diff_ref="HEAD"
+        )
+
+      siblings = summary["history_rag_siblings"]
+      self.assertEqual(
+          [s["path"] for s in siblings],
+          ["src/run.cpp", "src/caret.cpp"],
+      )
+      self.assertEqual(siblings[0]["co_commits"], 2)
+      self.assertEqual(siblings[0]["paired_with"], ["src/layout.cpp"])
+      self.assertEqual(siblings[1]["co_commits"], 1)
+      ctx_md = (out_dir / "context.md").read_text(encoding="utf-8")
+      self.assertIn("History-RAG Co-Modified Production Siblings", ctx_md)
+      self.assertIn("`src/run.cpp` (co-modified in 2 recent commit(s)", ctx_md)
+      self.assertNotIn("layout_test.cpp", ctx_md)
+      self.assertNotIn("guide.md", ctx_md)
+      self.assertNotIn("paint.cpp", ctx_md)
+
   # Verifies clean HEAD fallback stages the top commit when working tree has no unstaged changes
   def test_stage_local_clean_head_fallback(self) -> None:
     with tempfile.TemporaryDirectory() as tmp:

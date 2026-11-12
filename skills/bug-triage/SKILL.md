@@ -34,6 +34,28 @@ By default, any actionable bug involving core code contracts produces a reproduc
 2. **Check Linked & Existing Changes**:
    - Inspect existing linked CLs/PRs attached to the issue.
    - Query open self-owned changes (`owner:self status:open` on Gerrit; `gh pr list --author "@me"` on GitHub) matching the issue ID before creating any new change. If an open WIP CL already exists, reuse its `Change-Id` / branch.
+3. **Chrome Graphics F-Visor & CodeMender Guardrails**:
+   - **F-Visor Auto-Clustering Cooling Window (`2–3h` / `Ready for Triage`)**: On newly filed
+     Chrome Graphics `VULNERABILITY` crbugs (ClusterFuzz / F-Visor), check issue age, tags, and
+     duplicate links before spawning a worktree or WIP CL unless the user explicitly requested
+     immediate triage:
+     - F-Visor runs an automated `2–3h` triage and clustering pipeline that attaches root-cause
+       analysis, deduplicates sibling fuzzer testcases into a **Cluster Container Bug**, and
+       applies the `Ready for Triage` tag once clustering settles.
+     - If a `VULNERABILITY` crbug is `< 3h` old and lacks `Ready for Triage`, check whether
+       F-Visor has already reassigned or merged it into a Cluster Container Bug; if it is already
+       merged into a container bug, redirect triage to the container bug (`Outcome 5: Duplicate`).
+   - **CodeMender `PATCH_SUBMODULE` Diffs Are Unverified Hypotheses (`[UNVERIFIED HYPOTHESIS]`)**:
+     - When CodeMender attaches a patch affecting `third_party/skia` (or any submodule) on a
+       Chromium issue (`proposed-fix-*.diff` or `untested-proposed-fix-*.diff` with
+       `PATCH_SUBMODULE`), its validation loop skips Chromium CQ dry-runs and never runs standalone
+       Skia `dm`, `flutter-test-paragraph-engine`, `google3-test-paragraph`, or CanvasKit suites.
+     - Treat every attached `proposed-fix-*.diff` / `untested-proposed-fix-*.diff` strictly as an
+       **`[UNVERIFIED HYPOTHESIS]`**: never apply or endorse it blindly. Verify in code that it
+       addresses the true invariant root cause rather than masking symptoms at the wrong layer
+       (e.g. clamping an out-of-bounds index or adding a defensive null/early-return guard instead
+       of fixing the producer invariant), and prove the fix from scratch via `Gate A` (`PS1`
+       failing contract test) and `Gate B` (`PS2` full Skia/Flutter/Google3 corpus verification).
 
 ---
 
@@ -102,12 +124,17 @@ When Outcome 1 or 2 applies:
      - To prove reproduction and fix on the target OS, either:
        1. Register the test with `DEF_TEST` (not `UNIX_ONLY_TEST`, which expands to `DEF_TEST_DISABLED` outside `SK_BUILD_FOR_UNIX` in `tests/Test.h:306-310`) and load bundled test fonts directly from `resources/fonts/` (`GetResourceAsData` + `ToolUtils::TestFontMgr()->makeFromData`) or query the platform `SkFontMgr` (`ToolUtils::TestFontMgr()`) so the test executes without `--paragraph_fonts extra_fonts`, **or**
        2. Run a one-off `DO NOT SUBMIT` WIP CL pair on the live target bot (e.g., `Test-Android-Clang-GalaxyS24-CPU-Adreno750-arm64-Release-All-Android_NativeFonts_AndroidNDKFonts`) proving `FAILURE` without the fix and `SUCCESS` with the fix, then immediately `abandon` the temporary WIP CL.
+   - **`Bug:` trailer format (`<BUG-REF>` below)**: issues.chromium.org bugs use `chromium:<ID>`
+     (several: `Bug: chromium:<ID1>, chromium:<ID2>`); `b/<ID>` only for the project's own tracker
+     (issues.skia.org in Skia) and only once, right after `Bug: `, since Skia's commentlink for
+     `b/` requires that prefix. `audit_comments.py --commit-msg` blocks tokens that Gerrit does
+     not linkify
    - Commit and push `PS1` strictly as `%wip`:
      ```bash
      git add <test_files>
      git commit -m "[<module>] Add failing test for <topic>
 
-     Bug: b/<ID>
+     Bug: <BUG-REF>
      Assisted-by: <Model Name>"
      git push origin HEAD:refs/for/main%wip
      ```
@@ -138,11 +165,28 @@ When Outcome 1 or 2 applies:
      - Skia trybots: <Linux ASAN / Fontations, Mac CoreText / Fontations,
        Win11 DirectWrite, physical Android GalaxyS24 if run>
 
-     Bug: b/<ID>
+     Bug: <BUG-REF>
      Assisted-by: <Model Name>"
      git push origin HEAD:refs/for/main%wip
      ```
    - **Red Skia Canaries on Prepared / WIP CLs**: Whenever any Skia canary (`Canary-G3`, `Canary-Chromium`, `Canary-Android`) runs on the Skia CL and fails on unrelated or infrastructure targets **after** proving on the downstream roll CL that our part passed, save a sanitized English `/PATCHSET_LEVEL` Gerrit draft on the Skia CL's final current patchset via `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py triage --cl <CL> --save-draft` (or `python3 ~/.gemini/config/scripts/gerrit_draft.py save --cl <CL> --resolved --message "..."` for manual roll/stack proof), re-saving after any `NO_CODE_CHANGE` `Tested:` upload so the explanation lives on the Gerrit CL itself and not only in the issue tracker reply.
+4. **Post-Fix 4-Axis Variant Hunter (`Outcome 1` Only)**:
+   - Once `PS2` is verified, invoke one read-only `scout` or `research-google` (`Model="flash"`,
+     `<= 3` turns) pass to scan for sibling defects sharing the same root-cause pattern across 4
+     axes:
+     1. **Incomplete Fixes in the Same File / Class**: sibling methods, overloads, or loop passes in
+        the modified file/class that read or mutate the same state without the new invariant guard.
+     2. **Twin Backends & Ports**: parallel implementations across `SkParagraph` C++ <->
+        `WebParagraph` Dart <-> `webparagraph-ts`, font backends (`CoreText` <->
+        `Fontations`/`FreeType` <-> `DirectWrite`), and `LTR` <-> `RTL` symmetric branches.
+     3. **Callers & Callees**: immediate callers that pass unvalidated domain indices/bounds or
+        callees that make the same repealed assumption.
+     4. **Neighboring State-Machine Edges**: adjacent layout/paint transitions (`ellipsis`, `strut`,
+        `trailing spaces`, empty `run`s, placeholder spans).
+   - Keep `PS2` scoped to the reported bug unless a same-file incomplete fix is required for the
+     contract to hold; route any confirmed standalone `master` side-bugs to
+     `paragraph-bug-prioritization` intake (`skills/paragraph-bug-prioritization/SKILL.md`) and note
+     them in the Phase 4 chat summary.
 
 ---
 

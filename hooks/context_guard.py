@@ -2108,8 +2108,28 @@ def _usage_str(m: dict) -> str:
   )
 
 
+# Static turn-start directive prefixes that contain zero per-turn telemetry or timestamps
+STATIC_NOTICE_PREFIXES = (
+    "[LANGUAGE]",
+    "[CRITICAL CHALLENGE",
+    "[PERF OPTIMIZATION",
+    "[DESIGN / ROOT-CAUSE FORK",
+)
+
+
+def _is_static_notice(msg: str) -> bool:
+  stripped = (msg or "").lstrip()
+  return any(stripped.startswith(p) for p in STATIC_NOTICE_PREFIXES)
+
+
 def _inject(*messages: str) -> dict:
-  return {"injectSteps": [{"ephemeralMessage": msg} for msg in messages]}
+  # Place static directive notices ahead of dynamic per-turn telemetry notices
+  # so KV prompt-cache prefixes stay maximally stable across turns
+  ordered = sorted(
+      (m for m in messages if m),
+      key=lambda m: 0 if _is_static_notice(m) else 1,
+  )
+  return {"injectSteps": [{"ephemeralMessage": msg} for msg in ordered]}
 
 
 def append_log(record: dict) -> None:
@@ -2516,8 +2536,9 @@ def run(data: dict, log: dict) -> dict:
       state["soft_last_steps"] = steps
       save_state(state_path, state)
       target = resolve_handoff_target(conv_id, transcript_path, artifact_dir)
+      # Place static handoff guidance first and dynamic usage telemetry at the tail for KV caching
       messages.append(
-          f"[CONTEXT GUARD: SOFT LIMIT] Context is at {_usage_str(m)}. Keep"
+          "[CONTEXT GUARD: SOFT LIMIT] Keep"
           " working, and if further autonomous work remains after the nearest"
           " micro-boundary (test run finished, hypothesis confirmed or"
           " rejected, commit made, subagent returned), hand off so the"
@@ -2526,7 +2547,8 @@ def run(data: dict, log: dict) -> dict:
           " turn — write your complete response right here and end the turn"
           " (never do live multi-hypothesis debugging or self-contradiction"
           " loops inside your visible response text; finish all verification"
-          f" before writing the answer, and the next turn will hand off automatically):\n{TASKS_NOTE}\n"
+          f" before writing the answer, and the next turn will hand off automatically).\n{TASKS_NOTE}\n"
+          f"Context is at {_usage_str(m)}.\n"
           + handoff_steps(conv_id, target, build_continuation_title(conv_id))
       )
     if not is_turn_start:
@@ -2539,10 +2561,12 @@ def run(data: dict, log: dict) -> dict:
         log["fail_streak"] = streak
         state["last_warned_fail_step"] = last_cmd_idx
         save_state(state_path, state)
+        # Keep static two-strike directive ahead of the dynamic failure streak count
         messages.append(
-            f"[TWO-STRIKE DEBUG GUARD] Warning: {streak} consecutive commands in the current turn failed. "
-            f"DO NOT make a third blind guess! Stop, read the exact error output and source declarations (`.h` / docs), "
-            f"revert broken edits if needed (`git diff` / `git checkout`), and revise your hypothesis before proceeding."
+            "[TWO-STRIKE DEBUG GUARD] DO NOT make a third blind guess! Stop, read the exact error "
+            "output and source declarations (`.h` / docs), revert broken edits if needed "
+            "(`git diff` / `git checkout`), and revise your hypothesis before proceeding. "
+            f"(Warning: {streak} consecutive commands in the current turn failed.)"
         )
     return _inject(*messages) if messages else {}
 
@@ -2603,37 +2627,41 @@ def run(data: dict, log: dict) -> dict:
       if late
       else ""
   )
+  # Place static circuit-breaker and handoff directives before dynamic step/token counts
   if level == "loop":
     head = (
-        "[CONTEXT GUARD: MID-TURN CIRCUIT BREAKER] Single-turn iteration limit"
-        f" exceeded ({invocation_num} consecutive steps; context at"
-        f" {_usage_str(m)}). If you are ready to deliver your answer to the"
-        " user and wait for their reply, write the complete answer right here"
-        " and end the turn WITHOUT handing off (do not start live"
-        " multi-hypothesis debugging inside your visible response text);"
+        "[CONTEXT GUARD: MID-TURN CIRCUIT BREAKER] If you are ready to deliver"
+        " your answer to the user and wait for their reply, write the complete"
+        " answer right here and end the turn WITHOUT handing off (do not start"
+        " live multi-hypothesis debugging inside your visible response text);"
         " otherwise bring any half-edited file to a clean checkpoint and hand"
         " off."
+        f" Single-turn iteration limit exceeded ({invocation_num} consecutive"
+        f" steps; context at {_usage_str(m)})."
     )
   elif not is_turn_start:
+    # Keep mid-turn handoff rubric ahead of dynamic context window percentage
     head = (
-        f"[CONTEXT GUARD: MID-TURN HANDOFF] Context is at {_usage_str(m)}.{late_note}"
-        " If you are ready to answer the user's request right now and wait for"
-        " their reply, DO NOT hand off in this turn — write your complete"
-        " response right here and end the turn (do not start live"
-        " multi-hypothesis debugging inside your visible response text; the"
-        " next turn will hand off automatically). Otherwise, if further"
-        " autonomous investigation, edits, or tests are needed, stop at the"
-        " nearest safe checkpoint (no half-edited files, no new investigations)"
-        " and hand off now."
+        "[CONTEXT GUARD: MID-TURN HANDOFF] If you are ready to answer the"
+        " user's request right now and wait for their reply, DO NOT hand off in"
+        " this turn — write your complete response right here and end the turn"
+        " (do not start live multi-hypothesis debugging inside your visible"
+        " response text; the next turn will hand off automatically). Otherwise,"
+        " if further autonomous investigation, edits, or tests are needed, stop"
+        " at the nearest safe checkpoint (no half-edited files, no new"
+        " investigations) and hand off now."
+        f" Context is at {_usage_str(m)}.{late_note}"
     )
   else:
+    # Keep turn-start handoff rubric ahead of dynamic context window percentage
     head = (
-        f"[CONTEXT GUARD: HANDOFF REQUIRED] Context is at {_usage_str(m)}.{late_note}"
-        " Do NOT investigate or write the answer to the user's new request in"
-        " this chat (an answer written before handoff stays buried in a closed"
-        " chat while the continuation opens empty). Immediately hand off the"
-        " user's request to a new chat in this turn so the full answer is"
-        " delivered there, and reply here only with the continuation link."
+        "[CONTEXT GUARD: HANDOFF REQUIRED] Do NOT investigate or write the"
+        " answer to the user's new request in this chat (an answer written"
+        " before handoff stays buried in a closed chat while the continuation"
+        " opens empty). Immediately hand off the user's request to a new chat"
+        " in this turn so the full answer is delivered there, and reply here"
+        " only with the continuation link."
+        f" Context is at {_usage_str(m)}.{late_note}"
     )
   return _inject(f"{head}\n{TASKS_NOTE}\n{handoff_steps(conv_id, target, new_title)}")
 

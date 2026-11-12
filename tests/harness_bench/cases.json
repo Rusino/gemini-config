@@ -1,0 +1,155 @@
+{
+  "benchmark": "gemini-config-harness-tpr-fpr-v1",
+  "description": "Paired Frozen Bugs (positive escapes from INCIDENTS.md) and Safe Decoys (clean post-fix counterparts) scoring TPR, FPR, and TPR - FPR across amnesia-precommit, ruthless-code-audit, and keeper_skeptic.",
+  "cases": [
+    {
+      "id": "INC-FONT-PIN-BUG",
+      "kind": "frozen_bug",
+      "evaluator": "ruthless_audit",
+      "incident_ref": "INCIDENTS.md: Skia CL 1404196 (3d70807b95) pinned FreeType bounds 4071x65527 in SkRemoteGlyphCache_b576664769; broke Mac14/Mac15 NativeFonts_Fontations post-submit",
+      "expected_categories": ["test_font_metric_pins"],
+      "files": {
+        "tests/SkRemoteGlyphCacheTest.cpp": "// Verifies remote glyph cache bounds serialization for crbug/576664769\nDEF_TEST(SkRemoteGlyphCache_b576664769, r) {\n    auto fm = ToolUtils::TestFontMgr();\n    SkFont font(fm->makeFromFile(\"fonts/Distortable.ttf\"), 64.0f);\n    SkRect bounds = font.getBounds(1);\n    REPORTER_ASSERT(r, bounds.width() == 4071);\n}\n"
+      }
+    },
+    {
+      "id": "INC-FONT-PIN-DECOY",
+      "kind": "safe_decoy",
+      "evaluator": "ruthless_audit",
+      "incident_ref": "INCIDENTS.md: Skia CL 1411716 post-fix cross-platform relative/non-empty font bounds check",
+      "expected_categories": [],
+      "files": {
+        "tests/SkRemoteGlyphCacheTest.cpp": "// Verifies remote glyph cache bounds serialization for crbug/576664769\nDEF_TEST(SkRemoteGlyphCache_b576664769, r) {\n    auto fm = ToolUtils::TestFontMgr();\n    SkFont font(fm->makeFromFile(\"fonts/Distortable.ttf\"), 64.0f);\n    SkRect bounds = font.getBounds(1);\n    REPORTER_ASSERT(r, !bounds.isEmpty());\n}\n"
+      }
+    },
+    {
+      "id": "INC-SCOPE-DISCLAIMER-BUG",
+      "kind": "frozen_bug",
+      "evaluator": "commit_msg",
+      "incident_ref": "INCIDENTS.md: Skia CL 1418376 PS2-PS6 silent 'Not covered: ... for bidi lines' scope demotion and internal cl/ leak",
+      "expected_categories": ["commit_disclaimer", "commit_issue"],
+      "commit_msg": "[SkParagraph] Fix visual cluster shift\n\nAdjust cluster bounds on single-direction lines.\nSee cl/1008075988 for internal context.\n\nNot covered: visual-to-logical shift for bidi lines.\n\nAssisted-by: Gemini\nAssisted-by: Claude\nChange-Id: I12345\n"
+    },
+    {
+      "id": "INC-SCOPE-DISCLAIMER-DECOY",
+      "kind": "safe_decoy",
+      "evaluator": "commit_msg",
+      "incident_ref": "INCIDENTS.md: Clean Tier-1 commit message with Tested block, single Assisted-by, and valid 40-hex Change-Id",
+      "expected_categories": [],
+      "commit_msg": "[SkParagraph] Preserve RTL visual shift across BiDi runs\n\nKeep visual-to-logical cluster mapping monotonic when runs reorder.\nWithout the fix, SkParagraph_BidiClusterShift fails with x=0 != 12.5.\n\nTested:\n- Skia dm --src tests --nogpu --nativeFonts -m SkParagraph (276/276 tests)\n- google3 SkParagraph clients (1139 test targets): no regressions\nNot tested:\n- Windows DirectWrite trybot\n\nBug: chromium:466929543\nAssisted-by: Claude 4.6 Opus\nChange-Id: I0123456789abcdef0123456789abcdef01234567\n"
+    },
+    {
+      "id": "INC-WHOLE-FILE-IFDEF-BUG",
+      "kind": "frozen_bug",
+      "evaluator": "audit_comments_cpp",
+      "incident_ref": "INCIDENTS.md: Skia CL 1406897 whole-file #ifdef wrapper instead of GN/Bazel build source list selection",
+      "expected_categories": ["WHOLE_FILE_IFDEF"],
+      "is_new_file": true,
+      "files": {
+        "modules/skshaper/src/SkShaper_coretext.cpp": "#include \"include/core/SkTypes.h\"\n#ifdef SK_BUILD_FOR_MAC\nvoid shape_mac_run() {}\n#endif\n"
+      }
+    },
+    {
+      "id": "INC-WHOLE-FILE-IFDEF-DECOY",
+      "kind": "safe_decoy",
+      "evaluator": "audit_comments_cpp",
+      "incident_ref": "INCIDENTS.md: Build-selected platform .cpp file with local SK_DEBUG guard only",
+      "expected_categories": [],
+      "is_new_file": true,
+      "files": {
+        "modules/skshaper/src/SkShaper_coretext.cpp": "#include \"include/core/SkTypes.h\"\n// Shapes a unidirectional UTF-8 run using CoreText line creation\nvoid shape_mac_run() {\n#ifdef SK_DEBUG\n    int checked = 1;\n    (void)checked;\n#endif\n}\n"
+      }
+    },
+    {
+      "id": "INC-HEADER-CONTRACT-BUG",
+      "kind": "frozen_bug",
+      "evaluator": "audit_comments_cpp",
+      "incident_ref": "INCIDENTS.md: Skia CL 1409697 PS4 public header declaration and new test added without contract comments",
+      "expected_categories": ["FUNC_NO_CONTRACT", "TEST_NO_HEADER"],
+      "is_new_file": false,
+      "files": {
+        "modules/skparagraph/include/Paragraph.h": "class Paragraph {\npublic:\n    void updateFirstLineIndent(float firstLineIndent);\n};\n",
+        "modules/skparagraph/tests/SkParagraphTest.cpp": "DEF_TEST(SkParagraph_FirstLineIndent, reporter) {\n    REPORTER_ASSERT(reporter, true);\n}\n"
+      }
+    },
+    {
+      "id": "INC-HEADER-CONTRACT-DECOY",
+      "kind": "safe_decoy",
+      "evaluator": "audit_comments_cpp",
+      "incident_ref": "INCIDENTS.md: Public header declaration and DEF_TEST with concise English rationale comments",
+      "expected_categories": [],
+      "is_new_file": false,
+      "files": {
+        "modules/skparagraph/include/Paragraph.h": "class Paragraph {\npublic:\n    // Updates the first-line indent in layout points and marks line metrics dirty\n    void updateFirstLineIndent(float firstLineIndent);\n};\n",
+        "modules/skparagraph/tests/SkParagraphTest.cpp": "// Verifies contract IND1: negative firstLineIndent clamps to paragraph width\nDEF_TEST(SkParagraph_FirstLineIndent, reporter) {\n    REPORTER_ASSERT(reporter, true);\n}\n"
+      }
+    },
+    {
+      "id": "INC-HOT-ALLOC-AND-GUARD-BUG",
+      "kind": "frozen_bug",
+      "evaluator": "ruthless_audit",
+      "incident_ref": "INCIDENTS.md & R138: Hot-path allocation in layout, defensive null return, and post-early-exit tautological guard",
+      "expected_categories": [
+        "hot_path_allocations",
+        "defensive_null_returns",
+        "post_early_exit_tautologies",
+        "consecutive_collection_loops"
+      ],
+      "files": {
+        "modules/skparagraph/src/ParagraphLayout.cpp": "void layoutParagraphRuns(Run* run, std::vector<int>& items) {\n    if (!run) { return; }\n    if (run != nullptr) {\n        auto scratch = std::make_unique<int>(42);\n        (void)scratch;\n    }\n    for (auto& x : items) {\n        x += 1;\n    }\n    for (auto& y : items) {\n        y += 2;\n    }\n}\n"
+      }
+    },
+    {
+      "id": "INC-HOT-ALLOC-AND-GUARD-DECOY",
+      "kind": "safe_decoy",
+      "evaluator": "ruthless_audit",
+      "incident_ref": "INCIDENTS.md & R138: Zero-allocation layout helper with SkASSERT precondition and dependent two-pass reduction",
+      "expected_categories": [],
+      "files": {
+        "modules/skparagraph/src/ParagraphLayout.cpp": "// Accumulates cluster advances and normalizes relative offsets against total width\nvoid layoutParagraphRuns(Run* run, std::vector<int>& items) {\n    SkASSERT(run != nullptr);\n    int total = 0;\n    for (auto& x : items) {\n        total += x;\n    }\n    for (auto& y : items) {\n        y -= total;\n    }\n}\n"
+      }
+    },
+    {
+      "id": "INC-SKEPTIC-LEDGER-BUG",
+      "kind": "frozen_bug",
+      "evaluator": "finding_ledger",
+      "incident_ref": "INCIDENTS.md: Unrefuted B3 visual-vs-logical RTL shift candidate on SkParagraph must stay active for keeper_skeptic",
+      "expected_categories": ["active_unrefuted_finding"],
+      "ledger_entries": [
+        {
+          "file": "modules/skparagraph/src/TextLine.cpp",
+          "symbol": "TextLine::measureTextInsideOneRun",
+          "claim": "trailing spaces excluded from visual bounds",
+          "reason": "REFUTED by keeper_skeptic: TextLine.cpp:L412 explicitly clips ghost spaces",
+          "scope": "repo"
+        }
+      ],
+      "candidate_finding": {
+        "file": "modules/skparagraph/src/TextLine.cpp",
+        "symbol": "TextLine::getRectsForRange",
+        "claim": "B3 visual-vs-logical RTL cluster shift lost when iterating runs"
+      }
+    },
+    {
+      "id": "INC-SKEPTIC-LEDGER-DECOY",
+      "kind": "safe_decoy",
+      "evaluator": "finding_ledger",
+      "incident_ref": "INCIDENTS.md: Prior keeper_skeptic refuted finding on unchanged file/symbol is suppressed by finding_ledger",
+      "expected_categories": [],
+      "ledger_entries": [
+        {
+          "file": "modules/skparagraph/src/TextLine.cpp",
+          "symbol": "TextLine::measureTextInsideOneRun",
+          "claim": "trailing spaces excluded from visual bounds",
+          "reason": "REFUTED by keeper_skeptic: TextLine.cpp:L412 explicitly clips ghost spaces",
+          "scope": "repo"
+        }
+      ],
+      "candidate_finding": {
+        "file": "modules/skparagraph/src/TextLine.cpp",
+        "symbol": "TextLine::measureTextInsideOneRun",
+        "claim": "trailing spaces excluded from visual bounds"
+      }
+    }
+  ]
+}
