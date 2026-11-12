@@ -68,10 +68,10 @@ def compute_source_tree_sha256(repo: pathlib.Path) -> tuple[str, int]:
 
 
 def compute_git_metadata(repo: pathlib.Path, ref: str) -> dict[str, Any]:
-    commit_target = "HEAD" if ref == "WORKTREE" else ref
+    # Inspect HEAD because checkout_ref has already placed the tree at the requested target
     git_sha = (
         subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--short=12", commit_target],
+            ["git", "-C", str(repo), "rev-parse", "--short=12", "HEAD"],
             capture_output=True,
             text=True,
             check=True,
@@ -79,7 +79,7 @@ def compute_git_metadata(repo: pathlib.Path, ref: str) -> dict[str, Any]:
     )
     git_subject = (
         subprocess.run(
-            ["git", "-C", str(repo), "log", "-1", "--format=%s", commit_target],
+            ["git", "-C", str(repo), "log", "-1", "--format=%s", "HEAD"],
             capture_output=True,
             text=True,
             check=True,
@@ -275,10 +275,20 @@ def main() -> int:
         text=True,
         check=True,
     ).stdout.strip()
+    initial_branch = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
 
     def cleanup() -> None:
         log("=== Cleaning up working tree state ===", driver_log)
         try:
+            # Restore the initial branch or detached commit, followed by uncommitted diff
+            restore_target = initial_branch if initial_branch != "HEAD" else initial_head
+            checkout_ref(repo, restore_target, worktree_patch)
+            # checkout_ref applies the patch only for WORKTREE; a branch restore alone drops it
             checkout_ref(repo, "WORKTREE", worktree_patch)
         except Exception as e:
             log(f"WARNING: restoring worktree failed: {e}", driver_log)
@@ -302,8 +312,20 @@ def main() -> int:
                 compare_args.append(f"{label}={ref_dir}")
                 continue
 
-            log(f"=== [{label}] Switching to {ref} ===", driver_log)
-            checkout_ref(repo, ref, worktree_patch)
+            # Pin relative HEAD references to the starting point before earlier checkouts shift HEAD
+            checkout_target = ref
+            if ref == "HEAD":
+                checkout_target = initial_branch if initial_branch != "HEAD" else initial_head
+            elif ref.startswith("HEAD~") or ref.startswith("HEAD^"):
+                checkout_target = subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", f"{initial_head}{ref[4:]}"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+
+            log(f"=== [{label}] Switching to {ref} ({checkout_target}) ===", driver_log)
+            checkout_ref(repo, checkout_target, worktree_patch)
 
             # 1. Attestation: git metadata & disk source tree hash before build
             attestation: dict[str, Any] = {
