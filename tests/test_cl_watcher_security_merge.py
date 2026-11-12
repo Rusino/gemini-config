@@ -152,7 +152,8 @@ class SecurityMergeRepoHarness:
         "commit",
         "-m",
         "Fix integer overflow in SDF generation\n\n"
-        "Validate positive dimensions and guard buffer size.\n",
+        "Validate positive dimensions and guard buffer size.\n\n"
+        "Change-Id: I0123456789abcdef0123456789abcdef01234567\n",
     )
     self.fix_sha = _run_git(self.skia_dir, "rev-parse", "HEAD")
     _run_git(self.skia_dir, "update-ref", "refs/remotes/origin/main", self.fix_sha)
@@ -173,6 +174,15 @@ class SecurityMergeRepoHarness:
     _run_git(self.skia_dir, "commit", "-m", "[M156] Divergent SDF padding")
     tip = _run_git(self.skia_dir, "rev-parse", "HEAD")
     _run_git(self.skia_dir, "update-ref", "refs/remotes/origin/chrome/m156", tip)
+    _run_git(self.skia_dir, "checkout", "-q", "main")
+
+  def land_fix_on_m156_and_m157(self) -> None:
+    # m156 gets a Gerrit-style cherry-pick (same Change-Id, no -x trailer); m157 contains fix_sha
+    _run_git(self.skia_dir, "checkout", "-q", "-B", "tmp_m156", self.base_sha)
+    _run_git(self.skia_dir, "cherry-pick", self.fix_sha)
+    tip = _run_git(self.skia_dir, "rev-parse", "HEAD")
+    _run_git(self.skia_dir, "update-ref", "refs/remotes/origin/chrome/m156", tip)
+    _run_git(self.skia_dir, "update-ref", "refs/remotes/origin/chrome/m157", self.fix_sha)
     _run_git(self.skia_dir, "checkout", "-q", "main")
 
   def revert_fix_on_main(self) -> str:
@@ -454,6 +464,67 @@ class SecurityMergeRequestTest(unittest.TestCase):
         grp["blocking_reasons"],
     )
     self.assertEqual(self.repo.worktree_count(), 1)
+
+  # A fix already on a release branch (ancestor or same-Change-Id cherry-pick) needs no merge
+  # there; trial-picking it again fails with "previous cherry-pick is now empty"
+  def test_gate5_fix_already_on_branch_is_skipped_not_failed(self) -> None:
+    self._use_fresh_repo()
+    self.repo.land_fix_on_m156_and_m157()
+    grp = self._evaluate(self._make_bugs_dict())["990000100"]
+    self.assertTrue(grp["gates"]["cherry_pick"]["ok"], grp["blocking_reasons"])
+    self.assertTrue(grp["hard_gates_ok"], grp["blocking_reasons"])
+    present = {
+        r["milestone"]: r.get("already_present")
+        for r in grp["gates"]["cherry_pick"]["results"]
+    }
+    short = self.repo.fix_sha[:10]
+    self.assertEqual(present, {156: [short], 157: [short], 158: []})
+    self.assertIn(f"{short} is already on Skia chrome/m156 and m157.", grp["comment_draft"])
+    self.assertEqual(self.repo.worktree_count(), 1)
+
+  # The Chromium Skia autoroll linked to the parent only bumps DEPS; it ships the fix to main
+  # and never needs its own merge, but any other Chromium change on the parent still blocks
+  def test_gate2_skia_autoroll_on_parent_does_not_block(self) -> None:
+    roll_url = "https://chromium-review.git.corp.google.com/c/chromium/src/+/8795891"
+    bugs = self._make_bugs_dict(
+        parent_gerrit=(
+            "https://skia-review.git.corp.google.com/c/skia/+/1404196, " + roll_url
+        )
+    )
+    roll = {
+        "ok": True,
+        "cl_id": "8795891",
+        "host": "chromium-review.googlesource.com",
+        "project": "chromium/src",
+        "branch": "main",
+        "repo": "Chromium",
+        "status": "MERGED",
+        "subject": "Roll Skia from 8113c27ba6eb to 3d7e335da165 (4 revisions)",
+        "files": ["DEPS", "third_party/skia"],
+    }
+    for variant, expect_ok in (
+        ({}, True),
+        ({"files": ["DEPS", "third_party/skia", "skia/BUILD.gn"]}, False),
+        ({"subject": "Roll ANGLE from 1111111aaaaa to 2222222bbbbb"}, False),
+    ):
+      cl_map = self._mock_cl_details()
+      cl_map["8795891"] = dict(roll, **variant)
+      canary = self._default_canary_info()
+      with (
+          mock.patch.object(
+              w, "_fetch_merge_cl_detail", side_effect=lambda _h, cid: cl_map.get(cid, {})
+          ),
+          mock.patch.object(w, "_fetch_skia_roll_and_canary", return_value=canary),
+          mock.patch.object(w, "_refresh_skia_merge_refs"),
+      ):
+        grp = w.evaluate_security_merge_groups(
+            bugs, skia_dir=self.repo.skia_dir, now_ts=self.now_ts
+        )["990000100"]
+      self.assertEqual(
+          grp["gates"]["test_only_followups"]["ok"], expect_ok, (variant, grp["blocking_reasons"])
+      )
+      if expect_ok:
+        self.assertNotIn("8795891", grp["comment_draft"])
 
   def test_gate6_os_mismatch_warns_without_blocking_button(self) -> None:
     grp = self._evaluate(self._make_bugs_dict(m156_os="Android, Linux"))["990000100"]

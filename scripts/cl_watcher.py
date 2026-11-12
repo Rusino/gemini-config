@@ -10921,6 +10921,56 @@ def _check_skia_main_revert(
   return True, ""
 
 
+_SKIA_AUTOROLL_SUBJECT_RE = re.compile(r"^Roll Skia from [0-9a-f]{7,40} to [0-9a-f]{7,40}\b")
+_SKIA_AUTOROLL_FILES = frozenset({"DEPS", "third_party/skia"})
+
+
+def _is_chromium_skia_autoroll(cl_det: dict[str, Any], files: list[str]) -> bool:
+  """True for a chromium/src "Roll Skia from X to Y" CL that touches only DEPS/the gitlink."""
+  return (
+      str(cl_det.get("project") or "") == "chromium/src"
+      and bool(_SKIA_AUTOROLL_SUBJECT_RE.match(str(cl_det.get("subject") or "")))
+      and bool(files)
+      and set(files) <= _SKIA_AUTOROLL_FILES
+  )
+
+
+def _git_out(repo_dir: str, *args: str) -> tuple[int, str]:
+  res = subprocess.run(
+      ["git", "-C", repo_dir, *args],
+      capture_output=True,
+      text=True,
+      timeout=15,
+      check=False,
+  )
+  return res.returncode, res.stdout.strip()
+
+
+def _skia_sha_on_branch(skia_dir: str, sha: str, tip_sha: str) -> bool:
+  """True if `sha` is an ancestor of `tip_sha` or was cherry-picked there.
+
+  Gerrit/Chrome cherry-picks keep the Change-Id but add no `-x` trailer, so match either
+  the Change-Id or the `(cherry picked from commit <sha>)` line in commits since the fork point.
+  """
+  rc, _ = _git_out(skia_dir, "merge-base", "--is-ancestor", sha, tip_sha)
+  if rc == 0:
+    return True
+  rc, fork = _git_out(skia_dir, "merge-base", sha, tip_sha)
+  if rc != 0 or not fork:
+    return False
+  rc, body = _git_out(skia_dir, "log", "-1", "--format=%B", sha)
+  change_ids = re.findall(r"^Change-Id: (I[0-9a-f]{40})\s*$", body, flags=re.M)
+  needles = [f"Change-Id: {change_ids[-1]}"] if change_ids else []
+  needles.append(f"(cherry picked from commit {sha}")
+  for needle in needles:
+    rc, hit = _git_out(
+        skia_dir, "rev-list", "-n", "1", "-F", f"--grep={needle}", f"{fork}..{tip_sha}"
+    )
+    if rc == 0 and hit:
+      return True
+  return False
+
+
 def _trial_cherry_pick_skia(
     skia_dir: str,
     fix_shas: list[str],
@@ -10958,7 +11008,8 @@ def _trial_cherry_pick_skia(
         "reason": f"Branch chrome/m{milestone} not found in Skia repository",
     }
 
-  cache_key = f"{','.join(fix_shas)}|m{milestone}|{tip_sha}"
+  # v2 entries carry already_present; v1 re-picked fixes already on the branch
+  cache_key = f"v2|{','.join(fix_shas)}|m{milestone}|{tip_sha}"
   cp_cache = (
       state.setdefault("merge_cherry_pick_cache", {})
       if isinstance(state, dict)
@@ -10967,6 +11018,24 @@ def _trial_cherry_pick_skia(
   if isinstance(cp_cache, dict) and isinstance(cp_cache.get(cache_key), dict):
     return dict(cp_cache[cache_key])
 
+  already = [sha for sha in fix_shas if _skia_sha_on_branch(skia_dir, sha, tip_sha)]
+  pending = [sha for sha in fix_shas if sha not in already]
+  if pending:
+    out = _run_trial_cherry_pick(skia_dir, tip_sha, pending, milestone)
+  else:
+    out = {"ok": True, "milestone": milestone, "conflicts": [], "reason": ""}
+  out["already_present"] = [sha[:10] for sha in already]
+  if isinstance(cp_cache, dict):
+    if len(cp_cache) >= 256:
+      cp_cache.clear()
+    cp_cache[cache_key] = dict(out)
+  return out
+
+
+def _run_trial_cherry_pick(
+    skia_dir: str, tip_sha: str, shas: list[str], milestone: int
+) -> dict[str, Any]:
+  """Cherry-picks `shas` with -x onto `tip_sha` in a throwaway detached worktree."""
   wt_dir = tempfile.mkdtemp(prefix=f"fd_cp_m{milestone}_")
   try:
     add_res = subprocess.run(
@@ -10995,7 +11064,7 @@ def _trial_cherry_pick_skia(
               "user.email=jlavrova@google.com",
               "cherry-pick",
               "-x",
-              *fix_shas,
+              *shas,
           ],
           capture_output=True,
           text=True,
@@ -11060,11 +11129,6 @@ def _trial_cherry_pick_skia(
         timeout=8,
         check=False,
     )
-
-  if isinstance(cp_cache, dict):
-    if len(cp_cache) >= 256:
-      cp_cache.clear()
-    cp_cache[cache_key] = dict(out)
   return out
 
 
@@ -11369,6 +11433,9 @@ def evaluate_security_merge_groups(
       if str(f_det.get("branch") or "").startswith("chrome/m"):
         continue
       f_files = [str(p) for p in (f_det.get("files") or []) if str(p)]
+      # A Chromium Skia autoroll only bumps DEPS; the fix reaches release branches via Skia
+      if _is_chromium_skia_autoroll(f_det, f_files):
+        continue
       if not f_files:
         g2_ok = False
         g2_reason = (
@@ -11531,6 +11598,12 @@ def evaluate_security_merge_groups(
           skia_dir, fix_cls, state=state, allow_llm=allow_llm
       )
       sentences.append(f"Regression risk is low: {risk_clause}.")
+      present_on: dict[str, list[int]] = {}
+      for cp in cp_results:
+        for short in cp.get("already_present") or []:
+          present_on.setdefault(short, []).append(int(cp["milestone"]))
+      for short, ms_list in present_on.items():
+        sentences.append(f"{short} is already on {_format_merge_branches(ms_list)}.")
       branches_str = _format_merge_branches(milestones)
       sentences.append(
           f"It cherry-picks cleanly onto {branches_str}. Requesting merge approval."
