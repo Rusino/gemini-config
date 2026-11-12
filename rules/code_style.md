@@ -66,6 +66,10 @@ description: "When editing source code or tests, writing code comments, commit m
   non-const `T&`) only for reused hot-path buffers or existing Skia APIs. Use `enum class` or
   named structs instead of adjacent `bool`/`int` flags
 - Tests: no narrative comment before every assert; test domain edges, not C++ mechanics
+- Assert messages: numeric, index and count asserts print the actual value (and the expected one
+  when it is not a literal in the condition): `REPORTER_ASSERT(r, c, "got %g", v)`, gtest `<<`,
+  Dart `reason:`. Set loop or case context once per iteration (`skiatest::ReporterContext`,
+  gtest `SCOPED_TRACE`), not in every message; no message that restates a boolean condition
 - Tests check behavior through the public API (`Paragraph`, `TextLine` visitors); internal state
   (`runs()`, `clusters()`, run counts) only with a why-comment when that structure is the
   contract, never as a precondition for reading glyphs
