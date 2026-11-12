@@ -2274,6 +2274,310 @@ vm.runInThisContext(scriptContent + '\n' + harness);
         bugs["gh_issue:flutter/flutter#184815"]["linked_cls"][0]["shared_chat"]
     )
 
+  @staticmethod
+  def _write_test_projects(
+      tmp: str, extra: tuple[tuple[str, dict[str, object]], ...] = ()
+  ) -> None:
+    """Writes fixture Jetski project JSON files (active Skia + archived SkoreText + `extra`)."""
+    base = (
+        ("p-skia.json", {"id": "p-skia", "name": "Skia · ⟳ 1"}),
+        ("p-skore.json", {"id": "p-skore", "name": "SkoreText", "archived": True}),
+        *extra,
+    )
+    for fn, payload in base:
+      with open(os.path.join(tmp, fn), "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+  # Checks active project loading excludes archived projects while keeping historical lookup,
+  # and public CoreText/CTFont or archived-candidate bugs fall back safely without leaking
+  def test_load_active_project_names_and_coretext_bug_inference(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      self._write_test_projects(
+          tmp,
+          (
+              ("p-skp.json", {"id": "p-skp", "name": "SkParagraph"}),
+              ("p-wp.json", {"id": "p-wp", "name": "WebParagraph", "archived": True}),
+              (
+                  "p-ie.json",
+                  {"id": "p-ie", "name": "Improving Experience", "archived": True},
+              ),
+          ),
+      )
+      with mock.patch.object(w, "PROJECTS_DIR", tmp):
+        all_projs = w.load_project_names()
+        active_projs = w.load_active_project_names()
+
+    self.assertEqual(
+        all_projs,
+        {
+            "p-skia": "Skia",
+            "p-skp": "SkParagraph",
+            "p-skore": "SkoreText",
+            "p-wp": "WebParagraph",
+            "p-ie": "Improving Experience",
+        },
+    )
+    self.assertEqual(active_projs, {"p-skia": "Skia", "p-skp": "SkParagraph"})
+
+    for bug in (
+        {"source": "buganizer", "title": "CoreText variation axis clamping"},
+        {"source": "buganizer", "title": "SkTypeface_Mac_CT glyph bounds"},
+        {"source": "github", "bug_key": "gh_issue:flutter/flutter#99", "title": "CTFont crash"},
+    ):
+      self.assertEqual(
+          w.infer_project_for_bug(bug, all_projs), ("p-skia", "Skia"), bug["title"]
+      )
+    self.assertEqual(
+        w.infer_project_for_bug(
+            {"source": "buganizer", "title": "SkParagraph CoreText line height"},
+            all_projs,
+        ),
+        ("p-skp", "SkParagraph"),
+    )
+    skore_para_bug = {"source": "buganizer", "title": "SkoreText paragraph shaper"}
+    self.assertEqual(
+        w.infer_project_for_bug(skore_para_bug, all_projs), ("p-skore", "SkoreText")
+    )
+    self.assertEqual(
+        w.infer_project_for_bug(skore_para_bug, active_projs), ("p-skia", "Skia")
+    )
+    self.assertEqual(
+        w.infer_project_for_bug(
+            {"source": "buganizer", "title": "WebParagraph canvas crash"},
+            active_projs,
+        ),
+        ("p-skia", "Skia"),
+    )
+    self.assertEqual(
+        w.infer_project_for_bug(
+            {
+                "source": "github",
+                "bug_key": "gh_issue:flutter/flutter#100",
+                "title": "Text selection handle offset",
+            },
+            {"p-skia": "Skia"},
+        ),
+        ("p-skia", "Skia"),
+    )
+    self.assertEqual(
+        w.infer_project_for_bug(
+            {
+                "source": "buganizer",
+                "component_id": "2271566",
+                "title": "Jetski quota alert",
+            },
+            active_projs,
+        ),
+        ("", "Unassigned"),
+    )
+
+  # Checks sync_bugs_into_state heals archived projects on TTL and full syncs while preserving
+  # active multi-bug umbrella self-CL projects and healing once that CL chat is archived
+  def test_sync_bugs_heals_archived_project_even_with_full_proj_names(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      self._write_test_projects(tmp)
+      umb_cl: dict[str, object] = {
+          "item_key": "gerrit:1382196",
+          "kind": "gerrit",
+          "target_id": "1382196",
+          "status": "NEW",
+          "is_self": True,
+          "subject": "[SkoreText] Umbrella CoreText fix",
+          "linked_bug_keys": ["buganizer:581436835", "buganizer:581436836"],
+          "conversation_id": "cid-umbrella",
+          "chat_archived": False,
+          "project_id": "p-skore",
+          "project_name": "SkoreText",
+      }
+      state: dict[str, object] = {
+          "items": {"gerrit:1382196@cid-umbrella": umb_cl},
+          "bugs": {
+              "buganizer:581436834": {
+                  "bug_key": "buganizer:581436834",
+                  "source": "buganizer",
+                  "id": "581436834",
+                  "short_id": "crbug/581436834",
+                  "title": "CoreText font port issue",
+                  "status": "ASSIGNED",
+                  "priority": "P2",
+                  "assignee": "jlavrova@google.com",
+                  "conversation_id": "",
+                  "project_id": "",
+                  "project_name": "SkoreText",
+              },
+              "buganizer:581436835": {
+                  "bug_key": "buganizer:581436835",
+                  "source": "buganizer",
+                  "id": "581436835",
+                  "short_id": "crbug/581436835",
+                  "title": "CoreText umbrella bug A",
+                  "status": "ASSIGNED",
+                  "priority": "P2",
+                  "assignee": "jlavrova@google.com",
+                  "conversation_id": "",
+                  "project_id": "p-skore",
+                  "project_name": "SkoreText",
+              },
+              "buganizer:581436836": {
+                  "bug_key": "buganizer:581436836",
+                  "source": "buganizer",
+                  "id": "581436836",
+                  "short_id": "crbug/581436836",
+                  "title": "CoreText umbrella bug B",
+                  "status": "ASSIGNED",
+                  "priority": "P2",
+                  "assignee": "jlavrova@google.com",
+                  "conversation_id": "",
+                  "project_id": "p-skore",
+                  "project_name": "SkoreText",
+              },
+          },
+          "last_bug_sync_ts": w.time.time(),
+      }
+      full_projs = {"p-skia": "Skia", "p-skore": "SkoreText"}
+      open_out = (
+          "Issue ID: 581436834\n"
+          "Component ID: 1457031\n"
+          "Assignee: jlavrova@google.com\n"
+          "Status: ASSIGNED\n"
+          "Priority: P2\n"
+          "Title: SkoreText axis fallback\n"
+          "Modified Time: 2026-11-12T12:00:00Z\n\n---\n\n"
+          "Issue ID: 581436835\n"
+          "Component ID: 1457031\n"
+          "Assignee: jlavrova@google.com\n"
+          "Status: ASSIGNED\n"
+          "Priority: P2\n"
+          "Title: CoreText umbrella bug A\n"
+          "Modified Time: 2026-11-12T12:00:00Z\n\n---\n\n"
+          "Issue ID: 581436836\n"
+          "Component ID: 1457031\n"
+          "Assignee: jlavrova@google.com\n"
+          "Status: ASSIGNED\n"
+          "Priority: P2\n"
+          "Title: CoreText umbrella bug B\n"
+          "Modified Time: 2026-11-12T12:00:00Z\n"
+      )
+      with (
+          mock.patch.object(w, "PROJECTS_DIR", tmp),
+          mock.patch.object(w, "discover_bug_chats", return_value={}),
+          mock.patch.object(w, "fetch_github_bugs", return_value=[]),
+          mock.patch.object(
+              w, "call_buganizer_mcp_batch", return_value=[open_out, ""]
+          ),
+      ):
+        w.sync_bugs_into_state(
+            state, force=False, wake_chats=False, proj_names=full_projs
+        )
+        bugs_ttl = state["bugs"]
+        assert isinstance(bugs_ttl, dict)
+        self.assertEqual(bugs_ttl["buganizer:581436834"]["project_id"], "p-skia")
+        self.assertEqual(bugs_ttl["buganizer:581436834"]["project_name"], "Skia")
+        self.assertEqual(bugs_ttl["buganizer:581436835"]["project_name"], "SkoreText")
+
+        # Once GC force-archives the linked CL chat and orphans a bug's old chat, full sync heals
+        umb_cl["chat_archived"] = True
+        bugs_ttl["buganizer:581436834"]["conversation_id"] = "cid-orphaned"
+        bugs_ttl["buganizer:581436834"]["project_id"] = "p-skore"
+        bugs_ttl["buganizer:581436834"]["project_name"] = "SkoreText"
+
+        w.sync_bugs_into_state(
+            state, force=True, wake_chats=False, proj_names=full_projs
+        )
+        bugs_full = state["bugs"]
+        assert isinstance(bugs_full, dict)
+        self.assertEqual(bugs_full["buganizer:581436834"]["conversation_id"], "")
+        self.assertEqual(bugs_full["buganizer:581436834"]["project_id"], "p-skia")
+        self.assertEqual(bugs_full["buganizer:581436834"]["project_name"], "Skia")
+        self.assertEqual(bugs_full["buganizer:581436835"]["project_id"], "p-skia")
+        self.assertEqual(bugs_full["buganizer:581436835"]["project_name"], "Skia")
+
+  # Checks chat launch reroutes archived projects to active Skia (including placeholder topic
+  # fallback and concurrent state-mutation merges) so GC never auto-archives newly spawned chats
+  def test_start_chat_reroutes_archived_project_to_active_skia(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      self._write_test_projects(tmp)
+      state: dict[str, object] = {
+          "bugs": {
+              "buganizer:581436834": {
+                  "bug_key": "buganizer:581436834",
+                  "id": "581436834",
+                  "short_id": "crbug/581436834",
+                  "title": "Bug 581436834",
+                  "status": "ASSIGNED",
+                  "priority": "P2",
+                  "assignee": "jlavrova@google.com",
+                  "project_id": "p-skore",
+                  "project_name": "SkoreText",
+              }
+          },
+          "items": {},
+      }
+      rec: dict[str, object] = {
+          "item_key": "gerrit:1382196",
+          "kind": "gerrit",
+          "target_id": "1382196",
+          "subject": "[fix] Update bug",
+          "project_id": "p-skore",
+          "project_name": "SkoreText",
+      }
+      items: dict[str, object] = {"gerrit:1382196@unchatted": rec}
+      base_snapshot = json.loads(
+          json.dumps({"bugs": state["bugs"], "items": items})
+      )
+      in_flight = json.loads(json.dumps(base_snapshot))
+      spawned: list[dict[str, object]] = []
+
+      def fake_start(**kwargs: object) -> str:
+        spawned.append(dict(kwargs))
+        return f"cid-{len(spawned)}"
+
+      with (
+          mock.patch.object(w, "PROJECTS_DIR", tmp),
+          mock.patch.object(w, "discover_bug_chats", return_value={}),
+          mock.patch.object(
+              w.cl, "resolve_handoff_model", return_value={"enum": "MODEL_PRO"}
+          ),
+          mock.patch.object(
+              w.cl, "start_conversation_exact", side_effect=fake_start
+          ),
+      ):
+        res_bug = w._start_chat_for_bug(state, "buganizer:581436834", save=False)
+        res_rec = w._start_pinned_chat_for_record(
+            items, "gerrit:1382196", "gerrit:1382196@unchatted", rec, "Review"
+        )
+
+      self.assertTrue(res_bug["ok"])
+      self.assertEqual(res_bug["project_id"], "p-skia")
+      self.assertEqual(spawned[0]["project_id"], "p-skia")
+      self.assertIn("Skia", str(spawned[0]["title"]))
+      self.assertNotIn("SkoreText", str(spawned[0]["title"]))
+      bugs = state["bugs"]
+      assert isinstance(bugs, dict)
+      self.assertEqual(bugs["buganizer:581436834"]["project_id"], "p-skia")
+      self.assertEqual(bugs["buganizer:581436834"]["project_name"], "Skia")
+
+      self.assertTrue(res_rec["ok"])
+      self.assertEqual(res_rec["project_id"], "p-skia")
+      self.assertEqual(spawned[1]["project_id"], "p-skia")
+      self.assertIn("Skia", str(spawned[1]["title"]))
+      self.assertNotIn("SkoreText", str(spawned[1]["title"]))
+      self.assertEqual(rec["project_id"], "p-skia")
+      self.assertEqual(rec["project_name"], "Skia")
+
+      # Concurrent poll merges must preserve rerouted project_id/project_name and chat_woken_ts
+      disk_after_start = {"bugs": state["bugs"], "items": items}
+      with mock.patch.object(w, "load_watcher_state", return_value=disk_after_start):
+        w.merge_concurrent_state_mutations(in_flight, base_snapshot)
+      merged_bug = in_flight["bugs"]["buganizer:581436834"]
+      self.assertEqual(merged_bug["conversation_id"], "cid-1")
+      self.assertEqual(merged_bug["project_id"], "p-skia")
+      self.assertEqual(merged_bug["project_name"], "Skia")
+      self.assertGreater(float(merged_bug.get("chat_woken_ts") or 0.0), 0.0)
+      merged_item = in_flight["items"]["gerrit:1382196@cid-2"]
+      self.assertEqual(merged_item["project_id"], "p-skia")
+      self.assertEqual(merged_item["project_name"], "Skia")
+
 
 if __name__ == "__main__":
   unittest.main()

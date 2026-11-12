@@ -996,6 +996,21 @@ def load_project_names() -> dict[str, str]:
   return res
 
 
+def load_active_project_names(
+    proj_names: dict[str, str] | None = None,
+    *,
+    archived_pids: set[str] | None = None,
+) -> dict[str, str]:
+  """Returns `{project_id: project_name}` for non-archived Jetski projects."""
+  pnames = proj_names if proj_names is not None else load_project_names()
+  arch = (
+      archived_pids
+      if archived_pids is not None
+      else cl._load_archived_project_ids(PROJECTS_DIR)
+  )
+  return {pid: name for pid, name in pnames.items() if pid not in arch}
+
+
 def _chat_candidate_rank(
     item: dict[str, Any],
 ) -> tuple[bool, bool, bool, str]:
@@ -7150,6 +7165,46 @@ def _is_assigned_reviewer_record(rec: dict[str, Any]) -> bool:
   return entity_state.is_reviewer_change(rec)
 
 
+def _resolve_non_archived_launch_project(
+    proj_ref: str,
+    fallback_pid: str = "",
+    *,
+    exclude_meta: bool = False,
+) -> tuple[str, str]:
+  """Resolves `proj_ref` for a new chat, rerouting archived projects to active Skia.
+
+  Returns `(project_id, rerouted_project_name)` where `rerouted_project_name` is
+  non-empty only when an archived project was redirected.
+  """
+  ref = (proj_ref or "").strip()
+  # Keep internal Jetski/OneQuota bugs pinned to Improving Experience while excluding meta chats
+  allow_ref = bool(ref) and (
+      not exclude_meta
+      or ref == "Improving Experience"
+      or ref not in META_PROJECT_NAMES
+  )
+  try:
+    project_id = (
+        cl.resolve_project_id(ref, projects_dir=PROJECTS_DIR)
+        if allow_ref
+        else "outside-of-project"
+    )
+  except ValueError:
+    project_id = (fallback_pid or "").strip() or "outside-of-project"
+
+  # Daily chat GC force-archives open chats inside archived projects (e.g. SkoreText)
+  archived_pids = cl._load_archived_project_ids(PROJECTS_DIR)
+  if project_id not in archived_pids:
+    return project_id, ""
+
+  for cand_pid, cand_name in load_active_project_names(
+      archived_pids=archived_pids
+  ).items():
+    if cand_name.lower() == "skia":
+      return cand_pid, cand_name
+  return "outside-of-project", "Unassigned"
+
+
 def _start_pinned_chat_for_record(
     items: dict[str, Any],
     ikey: str,
@@ -7160,14 +7215,12 @@ def _start_pinned_chat_for_record(
 ) -> dict[str, Any]:
   """Creates a project-pinned visible Jetski chat for `rec` with `prompt`."""
   proj_ref = str(rec.get("project_name") or rec.get("project_id") or "").strip()
-  try:
-    project_id = (
-        cl.resolve_project_id(proj_ref) if proj_ref else "outside-of-project"
-    )
-  except ValueError:
-    project_id = str(rec.get("project_id") or "").strip() or "outside-of-project"
+  project_id, rerouted_name = _resolve_non_archived_launch_project(
+      proj_ref, str(rec.get("project_id") or "")
+  )
 
-  topic = _build_start_chat_topic(rec)
+  topic_rec = {**rec, "project_name": rerouted_name} if rerouted_name else rec
+  topic = _build_start_chat_topic(topic_rec)
   full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
   try:
     model_info = cl.resolve_handoff_model(
@@ -7187,6 +7240,8 @@ def _start_pinned_chat_for_record(
   )
   rec["title"] = full_title
   rec["project_id"] = project_id
+  if rerouted_name:
+    rec["project_name"] = rerouted_name
   rec["chat_busy"] = True
   rec["chat_woken_ts"] = time.time()
   rec["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
@@ -7257,23 +7312,16 @@ def _start_chat_for_bug(
     }
 
   proj_ref = str(bug.get("project_name") or bug.get("project_id") or "").strip()
-  try:
-    # Keep internal Jetski/OneQuota bugs pinned to Improving Experience while excluding meta chats
-    project_id = (
-        cl.resolve_project_id(proj_ref)
-        if (
-            proj_ref
-            and (proj_ref == "Improving Experience" or proj_ref not in META_PROJECT_NAMES)
-        )
-        else "outside-of-project"
-    )
-  except ValueError:
-    project_id = str(bug.get("project_id") or "").strip() or "outside-of-project"
+  project_id, rerouted_name = _resolve_non_archived_launch_project(
+      proj_ref, str(bug.get("project_id") or ""), exclude_meta=True
+  )
 
   rec_for_topic = {
       **bug,
       "kind": "gh_issue" if bug_key.startswith("gh_issue:") else "buganizer",
   }
+  if rerouted_name:
+    rec_for_topic["project_name"] = rerouted_name
   topic = _build_start_chat_topic(rec_for_topic)
   full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
   url = str(bug.get("url") or bug.get("short_id") or bug_key)
@@ -7314,6 +7362,8 @@ def _start_chat_for_bug(
   bug["chat_title"] = full_title
   bug["chat_archived"] = False
   bug["project_id"] = project_id
+  if rerouted_name:
+    bug["project_name"] = rerouted_name
   bug["chat_busy"] = True
   bug["chat_woken_ts"] = time.time()
   bug["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
@@ -10102,12 +10152,13 @@ def infer_project_for_bug(
   """Maps an unchatted bug to the matching Jetski project `(project_id, project_name)`."""
   by_name = {name.lower(): (pid, name) for pid, name in proj_names.items()}
 
-  def pick(*candidates: str) -> tuple[str, str]:
+  def pick(*candidates: str, fallback: str = "Unassigned") -> tuple[str, str]:
     for cand in candidates:
       hit = by_name.get(cand.lower())
       if hit:
         return hit
-    return ("", candidates[0] if candidates else "Skia")
+    # Never stamp an excluded/archived candidate name when active projects were supplied
+    return ("", fallback if by_name else (candidates[0] if candidates else "Skia"))
 
   comp_id = str(bug.get("component_id") or "").strip()
   blob = " ".join([
@@ -10119,16 +10170,19 @@ def infer_project_for_bug(
   # Route internal Jetski (component 2271566) and OneQuota bugs out of Skia
   if comp_id == "2271566" or any(k in blob for k in ("jetski", "onequota")):
     return pick("Improving Experience")
-  if any(k in blob for k in ("skoretext", "coretext", "ctfont", "_mac_ct")):
+  if "skoretext" in blob:
     return pick("SkoreText", "Skia")
   if "webparagraph" in blob or (
       bug.get("source") == "github" and ("platform-web" in blob or "[web]" in blob)
   ):
-    return pick("WebParagraph")
+    return pick("WebParagraph", "Skia")
   if any(k in blob for k in ("textcluster", "textmetrics", "shapedtext", "canvas2d")):
     return pick("TextClusters API", "Chromium", "Skia")
   if any(k in blob for k in ("skparagraph", "skunicode", "skshaper", "paragraph")):
     return pick("SkParagraph", "Skia")
+  # Public CoreText/CTFont port issues belong to Skia, not the archived SkoreText project
+  if any(k in blob for k in ("coretext", "ctfont", "_mac_ct")):
+    return pick("Skia")
   if bug.get("source") == "github":
     bkey = str(bug.get("bug_key") or "")
     raw_bug_repo = (
@@ -10141,7 +10195,7 @@ def infer_project_for_bug(
     )
     # Leave external GitHub issues without paragraph/web keywords Unassigned
     if not gh_bug_repo or _is_target_github_repo(gh_bug_repo):
-      return pick("SkParagraph", "WebParagraph")
+      return pick("SkParagraph", "WebParagraph", "Skia")
     return ("", "Unassigned")
   return pick("Skia")
 
@@ -12727,6 +12781,30 @@ def _should_retain_bug_in_view(
   return False
 
 
+def _has_unchatted_archived_bug_project(
+    bug: dict[str, Any],
+    archived_pids: set[str],
+    archived_names: set[str] | None = None,
+) -> bool:
+  """Returns True if an unchatted bug without an active umbrella CL uses an archived project."""
+  if not (archived_pids or archived_names) or str(bug.get("conversation_id") or "").strip():
+    return False
+  # Preserve project propagated from active multi-bug umbrella self-CL chats in link_bugs_and_cls
+  if any(
+      isinstance(c, dict)
+      and bool(c.get("is_self"))
+      and bool(c.get("conversation_id"))
+      and not bool(c.get("chat_archived"))
+      for c in (bug.get("linked_cls") or [])
+  ):
+    return False
+  pid = str(bug.get("project_id") or "").strip()
+  pname = str(bug.get("project_name") or "").strip().lower()
+  return pid in archived_pids or (
+      not pid and bool(pname) and pname in (archived_names or set())
+  )
+
+
 def sync_bugs_into_state(
     state: dict[str, Any],
     *,
@@ -12737,6 +12815,9 @@ def sync_bugs_into_state(
 ) -> None:
   """Polls Buganizer/crbug and GitHub issues with a 2-min TTL and links them to CLs."""
   pnames = proj_names if proj_names is not None else load_project_names()
+  archived_pids = cl._load_archived_project_ids(PROJECTS_DIR)
+  archived_names = {pnames[pid].lower() for pid in archived_pids if pid in pnames}
+  active_pnames = load_active_project_names(pnames, archived_pids=archived_pids)
   prev_bugs: dict[str, Any] = state.get("bugs") or {}
   bug_acks: dict[str, Any] = state.setdefault("bug_acks", {})
   items: dict[str, Any] = state.setdefault("items", {})
@@ -12805,6 +12886,10 @@ def sync_bugs_into_state(
       pruned_fast[bk] = b
     for b in pruned_fast.values():
       _resolve_redacted_bug_title(b, pruned_fast)
+      if _has_unchatted_archived_bug_project(b, archived_pids, archived_names):
+        pid, pname = infer_project_for_bug(b, active_pnames)
+        b["project_id"] = pid
+        b["project_name"] = pname
       classify_bug_status(b, now_ts=now_ts)
     attach_merge_children_to_cls_and_bugs(pruned_fast, items)
     state["bugs"] = pruned_fast
@@ -13031,8 +13116,12 @@ def sync_bugs_into_state(
   _auto_assign_merged_self_cl_bugs(all_bugs, items, state, now_ts=now_ts)
   for bug in all_bugs.values():
     _resolve_redacted_bug_title(bug, all_bugs)
-    if not bug.get("project_name") or bug.get("project_name") == "Unassigned":
-      pid, pname = infer_project_for_bug(bug, pnames)
+    if (
+        not bug.get("project_name")
+        or bug.get("project_name") == "Unassigned"
+        or _has_unchatted_archived_bug_project(bug, archived_pids, archived_names)
+    ):
+      pid, pname = infer_project_for_bug(bug, active_pnames)
       bug["project_id"] = pid
       bug["project_name"] = pname
 
@@ -13647,6 +13736,17 @@ def merge_concurrent_state_mutations(
           "conversation_id"
       ):
         sbug["conversation_id"] = dbug["conversation_id"]
+        sbug["chat_archived"] = bool(dbug.get("chat_archived", False))
+        sbug["chat_busy"] = bool(dbug.get("chat_busy", False))
+        for cfield in (
+            "project_id",
+            "project_name",
+            "chat_title",
+            "chat_woken_ts",
+            "chat_last_modified",
+        ):
+          if dbug.get(cfield):
+            sbug[cfield] = dbug[cfield]
         changed = True
       if changed:
         classify_bug_status(sbug)
@@ -13675,6 +13775,14 @@ def merge_concurrent_state_mutations(
           rec["chat_busy"] = bool(ditem.get("chat_busy", True))
           if ditem.get("title") and not rec.get("title"):
             rec["title"] = ditem["title"]
+          for pfield in (
+              "project_id",
+              "project_name",
+              "chat_woken_ts",
+              "chat_last_modified",
+          ):
+            if ditem.get(pfield):
+              rec[pfield] = ditem[pfield]
           state_items[ckey] = rec
       sitem = state_items.get(ckey)
       if not isinstance(sitem, dict):
@@ -15281,7 +15389,7 @@ def _sync_once_locked(
                       "item_key": ikey,
                       "target_id": tid,
                       "conversation_id": cid,
-                      "project_name": d["project_name"],
+                      "project_name": str(record.get("project_name") or d["project_name"]),
                       "critical": False,
                       "message": (
                           f"[CL-WATCHER] 🔍 Auto-started code review for {ikey} "
@@ -15332,7 +15440,7 @@ def _sync_once_locked(
                 "item_key": ikey,
                 "target_id": tid,
                 "conversation_id": cid,
-                "project_name": d["project_name"],
+                "project_name": str(record.get("project_name") or d["project_name"]),
                 "critical": False,
                 "message": (
                     f"[CL-WATCHER] 🔄 Auto re-requested GitHub review from "
