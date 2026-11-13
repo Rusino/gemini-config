@@ -12927,6 +12927,37 @@ eval(code);
     )
     self.assertIn("R92_OPEN_CHAT_PASSED", res.stdout)
 
+  def test_triage_profile_includes_hydrogen_before_38_flash(self):
+    """Checks triage falls back to Hydrogen-L before 3.8 Flash while senior profiles exclude it."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "scripts", "jetski_closed_filter.js"), encoding="utf-8") as f:
+      js_src = f.read()
+    m = re.search(r"'triage':\s*\[([^\]]+)\]", js_src)
+    self.assertIsNotNone(m, "WEB_MODEL_PROFILES.triage not found")
+    triage_ids = re.findall(r"'([^']+)'", m.group(1))
+    self.assertIn("hydrogen-l-tf-xhigh", triage_ids)
+    self.assertIn("hydrogen-l-tf-high", triage_ids)
+    self.assertLess(triage_ids.index("gemini-flash-next"), triage_ids.index("hydrogen-l-tf-xhigh"))
+    self.assertLess(triage_ids.index("hydrogen-l-tf-xhigh"), triage_ids.index("hydrogen-l-tf-high"))
+    self.assertLess(
+        triage_ids.index("hydrogen-l-tf-high"), triage_ids.index("gemini-3.8-flash-high")
+    )
+
+    for senior_key in ("cpp-core", "orchestrator"):
+      sm = re.search(rf"'{senior_key}':\s*\[([^\]]+)\]", js_src)
+      self.assertIsNotNone(sm, f"WEB_MODEL_PROFILES.{senior_key} not found")
+      self.assertNotIn("hydrogen", sm.group(1).lower())
+
+    sys.path.insert(0, os.path.join(root, "hooks"))
+    import chat_lifecycle as cl
+
+    py_triage = cl.MODEL_PROFILES["triage"]
+    self.assertLess(py_triage.index("gemini-flash-next"), py_triage.index("hydrogen-l-tf-xhigh"))
+    self.assertLess(py_triage.index("hydrogen-l-tf-xhigh"), py_triage.index("hydrogen-l-tf-high"))
+    self.assertLess(py_triage.index("hydrogen-l-tf-high"), py_triage.index("gemini-3.8-flash-high"))
+    for senior_key in ("cpp-core", "orchestrator"):
+      self.assertFalse(any("hydrogen" in mid.lower() for mid in cl.MODEL_PROFILES[senior_key]))
+
 
 if __name__ == "__main__":
   unittest.main()

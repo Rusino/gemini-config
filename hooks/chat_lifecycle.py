@@ -144,6 +144,9 @@ def is_legacy_model(model_id: str = "", enum: str = "", label: str = "") -> bool
   return bool(LEGACY_MODEL_ID_RE.search(mid) or LEGACY_MODEL_LABEL_RE.search(lbl))
 
 
+# agentapi resolves `flash_lite` to tieredModelIds.flashLite (`gemini-3.5-flash-lite`,
+# MODEL_PLACEHOLDER_M198) and `flash` to tieredModelIds.flash (`gemini-3.8-flash-tiered`,
+# MODEL_PLACEHOLDER_M322); only `pro` maps to Gemini 3.1 Pro (MODEL_PLACEHOLDER_M136)
 def agentapi_model_arg(model: str) -> str:
   """Maps a requested agentapi `--model` value to a non-legacy one (tier or model id)."""
   m = (model or "").strip()
@@ -177,6 +180,8 @@ MODEL_PROFILES: dict[str, list[str]] = {
     ],
     "triage": [
         "gemini-flash-next",
+        "hydrogen-l-tf-xhigh",
+        "hydrogen-l-tf-high",
         "gemini-3.8-flash-high",
         "gemini-3.8-flash-medium",
         "gemini-3.5-flash-lite",

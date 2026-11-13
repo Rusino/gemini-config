@@ -646,9 +646,11 @@
     'gemini-launch-candidate-medium',
     'gemini-pro-coordinator',
     'auto',
-    // Tier 2: Secondary & modern 3.8 Flash reserve
+    // Tier 2: Secondary & modern Flash reserve (Hydrogen-L before 3.8 Flash)
     'fable-5.1-dropdown',
     'gemini-flash-next',
+    'hydrogen-l-tf-xhigh',
+    'hydrogen-l-tf-high',
     'gemini-3.8-flash-high',
     'gemini-3.8-flash-medium',
     // Tier 3: Light models
@@ -761,6 +763,8 @@
     ],
     'triage': [
       'gemini-flash-next',
+      'hydrogen-l-tf-xhigh',
+      'hydrogen-l-tf-high',
       'gemini-3.8-flash-high',
       'gemini-3.8-flash-medium',
       'gemini-3.5-flash-lite',
@@ -3866,6 +3870,8 @@
       const hitLite = catalog.byId.get('gemini-3.5-flash-lite');
       const hitFlashNext =
         catalog.byId.get('gemini-flash-next') ||
+        catalog.byId.get('hydrogen-l-tf-xhigh') ||
+        catalog.byId.get('hydrogen-l-tf-high') ||
         catalog.byId.get('gemini-3.8-flash-high') ||
         catalog.byId.get('gemini-3.8-flash-medium');
       const qLite = hitLite ? hitLite.quota : 0;
@@ -4142,6 +4148,8 @@
     const preferred = isFlash
       ? [
           'gemini-flash-next',
+          'hydrogen-l-tf-xhigh',
+          'hydrogen-l-tf-high',
           'gemini-3.8-flash-high',
           'gemini-3.8-flash-medium',
           'auto',
