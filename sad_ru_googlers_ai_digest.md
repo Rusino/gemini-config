@@ -82,10 +82,14 @@
   2. *Статический доктор из 18 проверок (`--skip-f1`)*: лимит `view_file` ровно 800 строк или 46 080 байт (45 KB); запрет выносить заглушки без флагов в `## Quick Start` (провоцируют агентов спамить `--help`); запрет удалять флаги при сжатии документации; правило 0-tool halt для защитных инструкций.
   3. *Zero Content Loss (`verify-diff`)*: валидация того, что ни один флаг, ссылка или параметр не потерялись при рефакторинге скилла.
   4. *Бенчмаркинг Evalin*: прогон тестов `EVAL.txtpb` с обязательным контролем отсутствия регрессий (`Candidate Pass Rate >= Baseline Pass Rate`).
-- **Вердикт полезности**: `🟡 Уже внедрено у нас (основная часть) + 🟢 1 проверка в R31`.
-- **Как предлагаем использовать**:
-  1. Базовые статические проверки (потолок `read_file` 800 строк / 46 080 байт на файлы скиллов и референсов, запрет `>` в YAML description, экранирование `|` в Markdown-таблицах) мы уже внедрили сегодня в `skills/amnesia-doc-check/scripts/check_doc_grounding.py` (коммит `70b06c9`).
-  2. Проверку `Zero Content Loss` (`verify-diff` — проверка, что при сокращении скилла или правила из него не пропали CLI-флаги и внутренние ссылки) добавляем в наш роадмап в эпик `R31` (`Code Comments & Skill Hygiene` в проекте `Improving Experience`).
+- **Вердикт полезности**: `🟡 Частично внедрено у нас (3 из 18 проверок в check_doc_grounding.py) + 🟢 Полезно — на выбор (ещё 4 статические проверки P1.4 / P2.1 / P3.1 / P5.1)`.
+- **Где это реализовано у нас и Дельта (чего у нас НЕТ)**:
+  1. **Что уже есть**: Базовые статические проверки (потолок `read_file` 800 строк / 46 080 байт на файлы скиллов и референсов, запрет `>` в YAML description, экранирование `|` в Markdown-таблицах) внедрены в [`check_doc_grounding.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/amnesia-doc-check/scripts/check_doc_grounding.py) (коммит `70b06c9`).
+  2. **Дельта (чего у нас НЕТ)**:
+     - `P5.1 Zero Content Loss` (`verify-diff` — проверка, что при сокращении скилла или правила из него не пропали `--flags`, `/google/bin/...` бинарники и `go/` ссылки).
+     - `P1.4` запрет хрупких диапазонов строк (`lines 32-144`, `#L100-L200`) в ссылках из `SKILL.md` на `references/*.md` (при правке референса номера строк тихо разъезжаются).
+     - `P2.1` запрет «голых» CLI-заглушек без флагов в таблицах `## Quick Start` (провоцирующих агентов тратить ход на `--help`).
+     - `P3.1` проверка уникальности YAML-ключей и отсутствия незаэкранированных `<`/`>` во фронтматтере `SKILL.md` (иначе парсер тихо выбрасывает скилл из `<skills>`).
 
 #### 3. Herdr и CRD `terminal_mode` для многоагентной работы в CLI
 - **Авторы**: Judith Hemp (`hempjudith@google.com`), Arthur Sonzogni, Ned Nguyen (30 окт., тред `spaces/AAQA45T8nC8/threads/LWYatSLRkx0`), Joe Downing (тред `spaces/AAQA45T8nC8/threads/LZ2CdRU_w1Q`).
@@ -132,7 +136,7 @@
   - В результате домен ушел в трехдневный таймаут до обновления DNS-зоны, сделав сервис временно недоступным.
 - **Вердикт полезности**: `🟡 Уже внедрено у нас (в KEEPER и Amnesia-проверках)`.
 - **Где это реализовано у нас**:
-  1. В наших системных правилах `plugins/keeper/rules/cpp_systems_invariants.md` инварианты *Type Bifurcation* (№1) и *Fail-fast Dimensional Honesty* (№2) как раз предотвращают подобные ошибки подмены типов (хэш/дайджест vs исходный открытый ключ/блоб).
+  1. В наших системных правилах [`plugins/keeper/rules/cpp_systems_invariants.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/keeper/rules/cpp_systems_invariants.md) инварианты *Domain & representation separation* (№1) и *Fail-fast dimensional honesty* (№2) как раз предотвращают подобные ошибки подмены типов (хэш/дайджест vs исходный открытый ключ/блоб).
   2. Этот случай подчеркивает критическую важность правила `rules/outgoing_text_verification.md`: никогда не верить модели на слово без верификации контрактов независимым скептиком (`keeper_skeptic`).
 
 #### 3. Паттерны суммаризации рассылок через фоновые задачи Jetski
@@ -348,11 +352,11 @@
     2. Для каждого CL создает изолированный Rift-воркспейс `reviewing_<cl>`.
     3. Запускает ревью-сессию в Jetski Hub на модели `Gemini Pro Next` в режиме `report` (вывод в чат) или `draft` (подготовка непубличных черновиков).
     4. Автоматически закрывает и удаляет воркспейс после закрытия или мерджа CL (`rift close reviewing_<cl> -f --delete-branch --clean-jetski`).
-    5. Содержит защиту от непроверенных авторов `ALLOWED_AUTHOR_DOMAINS` (`chromium.org,google.com,committers@chromium.org`) и явный инвариант **«Security & Untrusted Input Guardrail»** против prompt injection в чужих патчах (CL description, коммит-сообщения, комментарии, файлы `.agents/` / `.gemini/` / `AGENTS.md` строго трактуются как untrusted data).
-- **Вердикт полезности**: `🟢 Взято в роадмап: R38.7` (защитный инвариант от промпт-инъекций в `R38`) + `⚪ Не нужно (YAGNI)` (сам поллер воркспейсов Rift).
+    5. Содержит защиту от непроверенных авторов `ALLOWED_AUTHOR_DOMAINS` (`chromium.org,google.com,committers@chromium.org`), явный инвариант **«Security & Untrusted Input Guardrail»** против prompt injection в чужих патчах (CL description, коммит-сообщения, комментарии, файлы `.agents/` / `.gemini/` / `AGENTS.md` строго трактуются как untrusted data) и в разделе 7 рецепт **Inter-Patchset Working-Tree Delta (`<OLD_PS> -> <NEW_PS>`)** без записи в `.git` и без инвалидации `out/` (`HEAD` остаётся на `<OLD_PS>`, в рабочее дерево накатывается `<NEW_PS>` через `git diff --binary HEAD~1 | git apply -R` + `git apply`, так что `git diff` показывает чистую дельту между патчсетами, а `git diff HEAD~1` — полный дифф `<NEW_PS>`).
+- **Вердикт полезности**: `🟢 Взято в роадмап: R38.7` (защитный инвариант от промпт-инъекций в `R38`) + `🟢 Полезно — на выбор` (рецепт инкрементального патчсета `<OLD_PS> -> <NEW_PS>` без пересборки `out/` для `R38`) + `⚪ Не нужно (YAGNI)` (сам поллер воркспейсов Rift).
 - **Как предлагаем использовать**:
   1. Сам фоновый поллер Rift-воркспейсов нам не нужен: наш фокус — Skia и Flutter Engine в изолированных git-воркспейсах, а входящие ревью мы запускаем точечно через `review-triage` и `companion-cl-review`.
-  2. Защитный инвариант **Security & Untrusted Input Guardrail** предлагаем перенести в наши скиллы `skills/review-triage/SKILL.md` и `skills/companion-cl-review/SKILL.md` (подзадача в открытом эпике `R38`): жестко запретить агентам выполнять любые инструкции или менять системный промпт при обнаружении директив в описаниях чужих CL, комментариях Gerrit или файлах `.gemini/` / `AGENTS.md`, добавленных автором патча.
+  2. Защитный инвариант **Security & Untrusted Input Guardrail** занесён в `R38.7`, а рецепт **Inter-Patchset Working-Tree Delta (`<OLD_PS> -> <NEW_PS>`)** из раздела 7 [`ai-review-prompt-report.md`](file:///google/src/files/head/depot/google3/experimental/chrome-cap-ai-workspace/sidecars/gerrit-review-poller/prompt/ai-review-prompt-report.md) предлагаем добавить в эпик `R38` (`skills/review-triage/SKILL.md` и `skills/companion-cl-review/SKILL.md`), чтобы при повторном ревью нового патчсета не трогать `.git` и не вызывать лишнюю пересборку `out/`.
 
 
 ---
@@ -501,7 +505,7 @@
     1. **Cover-to-Vote Coupling**: строгий запрет подстроки `lgtm` в тексте cover-сообщения при удержании `CR+1` (чтобы ревьюер или автор не приняли вежливую формулировку за аппрув).
     2. **Silent-in-Review vs. Strict-in-Authoring**: жесткое соблюдение собственных стандартов оформления коммит-сообщений (`Test:`, отказ от `OMIT_IF_EMPTY`) при полном молчании о них в чужих CL, если нет содержательных дефектов.
     3. **Pre-AI Voice Cutoff & Held-Out 7-gram Backtest**: срез обучающего корпуса строго до апреля 2026 года (с фильтрацией агентских маркеров `TAG=agy`) и отложенная выборка из 60 CL с проверкой нулевого дословного 7-граммного пересечения ([`/google/src/files/head/depot/configs/users/msw/_agents/plugins/msw-digital-twin/training/backtest/heldout_overlap.py`](file:///google/src/files/head/depot/configs/users/msw/_agents/plugins/msw-digital-twin/training/backtest/heldout_overlap.py)).
-- **Вердикт полезности**: `⚪ Отложено при разборе` (правила `Cover-to-Vote Coupling` и `Silent-in-Review vs. Strict-in-Authoring` для наших скиллов ревью) + `⚪ Не нужно (YAGNI)` (веб-сайдбар Gerrit и `skydeck_triggers`).
+- **Вердикт полезности**: `🟢 Полезно — на выбор` (правила `Cover-to-Vote Coupling` в [`scripts/gerrit_draft.py`](file:///usr/local/google/home/jlavrova/.gemini/config/scripts/gerrit_draft.py), `Silent-in-Review vs. Strict-in-Authoring` и `ASD-STE100 Zero Boilerplate` из [`/google/src/files/head/depot/configs/users/alexmilan/_agents/AGENTS.md`](file:///google/src/files/head/depot/configs/users/alexmilan/_agents/AGENTS.md) для наших скиллов ревью) + `⚪ Не нужно (YAGNI)` (веб-сайдбар Gerrit и `skydeck_triggers`).
 - **Предложение по интеграции**:
   - Добавить в открытый эпик ревью-триажа `R38` (`Epic: Review-Triage & Gerrit Best Practices`, файлы [`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/review-triage/SKILL.md) и [`gerrit_draft.py`](file:///usr/local/google/home/jlavrova/.gemini/config/scripts/gerrit_draft.py)) проверку **Cover-to-Vote Coupling** (блокировать подстроку `lgtm` в верхнеуровневых черновиках обложки ревью, когда триаж классифицирует CL как `🟠 PUSHBACK` или находит блокирующие дефекты в `🔴 SURGICAL AUDIT`) и правило **Silent-in-Review vs. Strict-in-Authoring** (не делать замечаний внешним авторам по формату блока `Tested:` или локальным конвенциям наших собственных коммитов). Методику held-out 7-gram валидации и `Pre-AI Cutoff` сохранить как референс для замороженной задачи `R33` ([`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/veteran-review/SKILL.md)).
 
@@ -560,7 +564,7 @@
     2. Переписывание с нуля («токенмаксинг»): при задаче интеграции внешней open-source библиотеки для аудио модель вместо вендоринга/подключения апстрима втихую написала собственный велосипед с нуля («я вдохновилась дизайном и сама всё написала»), породив огромный непроверенный дифф.
 - **Вердикт полезности**: `🟡 Уже внедрено у нас`.
 - **Где это реализовано у нас**:
-  - Первая проблема жестко пресекается правилами честности отчетности в [`rules/reporting-integrity.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/reporting-integrity.md) (запрет утверждать то, что не получено из реального вывода команды/файла; запрет выдумывать поведение runtime без `file:line` в [`rules/outgoing_text_verification.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/outgoing_text_verification.md)) и принципом анти-поддакивания в [`rules/communication_style.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/communication_style.md) (*Pushback*).
+  - Первая проблема жестко пресекается правилами честности отчетности и верификации в [`rules/outgoing_text_verification.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/outgoing_text_verification.md) (запрет утверждать то, что не получено из реального вывода команды/файла; запрет выдумывать поведение runtime без `file:line`) и принципом анти-поддакивания в [`rules/communication_style.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/communication_style.md) (*Pushback*).
   - Вторая проблема отсекается строгим YAGNI в [`rules/code_style.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/code_style.md) (никаких самописных оберток и неиспользуемых велосипедов) и требованием минимального диффа в [`skills/amnesia-precommit/SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/amnesia-precommit/SKILL.md).
 
 ---
@@ -576,9 +580,9 @@
     1. `capability_groups` поддерживают RE2 фильтры путей (`path_expression`, `path_expression_exclusion`) и таргетинг по содержимому добавленных строк диффа (`content_patterns`, проверяются строго добавленные `+`-строки, без оверхеда на весь файл). При совпадении подключаются специализированные скиллы или воркеры с правилами базы знаний (`knowledge_base/*.md`).
     2. Поддерживаются `exclude_skills` и `exclude_rules`, действующие на весь CL (позволяет поддиректориям исключать шумные общие правила предков).
     3. Сервис пока доступен только для учетных записей Googler (`@google.com` и связанные `@chromium.org`) и пока не интегрирован с диалоговым сайдбаром Gerrit.
-- **Вердикт полезности**: `🟡 Уже внедрено у нас` (триггеры по `+`-строкам диффа уже запланированы в открытом эпике `R38`).
-- **Где это реализовано у нас**:
-  - Фильтрация по добавленным строкам диффа (`'+' regex filter (koerber@)`) уже зафиксирована как ключевой элемент в открытом эпике `R38` ([`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/review-triage/SKILL.md)). Иерархия `DIR_METADATA` специфична для монорепозитория Chromium; в Skia правила организованы централизованно через условные markdown-файлы в `rules/`.
+- **Вердикт полезности**: `🟢 Полезно — на выбор` (триггеры строго по `+`-строкам диффа и `path_expression_exclusion` для тестовых/бенчмарк директорий ещё НЕ реализованы в коде — числятся как `todo` в эпике `R38`).
+- **Дельта (чего у нас НЕТ)**:
+  - В [`skills/review-triage/SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/review-triage/SKILL.md) и [`scripts/stage_diff_context.py`](file:///usr/local/google/home/jlavrova/.gemini/config/scripts/stage_diff_context.py) фильтрация специализированных проверок строго по добавленным `+`-строкам диффа (`content_patterns`) и исключение шумных правил hot-path аллокаций для `tests/`, `bench/`, `gm/` (`path_expression_exclusion`) пока находятся в статусе `todo` (`R38`), а не внедрены в скрипт.
 
 #### 2. Ограничения `CreateProject` и токенов агентов в Jetski, изоляция песочницы (`ANTIGRAVITY_CSRF_TOKEN`) и статус форка воркспейсов
 - **Авторы**: Russ Hamilton (`behamilton@google.com`, 12:09, 13:51 ET / 17:09, 18:51 UTC, тред `spaces/AAQA45T8nC8/threads/uIjVbJVr_P8`), Eric Leese (`leese@google.com`, 12:07 ET), Adam Norberg (`norberg@google.com`, 13:14 ET).
@@ -590,7 +594,7 @@
   - Adam Norberg и Russ Hamilton обсудили обходные пути (снятие переменных окружения или запуск `jetski token` в терминале), однако Russ подчеркнул нежелательность таких хаков («my guidelines prohibit me from implementing»).
 - **Вердикт полезности**: `🟡 Уже внедрено у нас` (соблюдение песочницы в правилах) + `⚪ Не нужно (YAGNI)` (CoG-специфичные форки).
 - **Где это реализовано у нас**:
-  - В [`rules/reporting-integrity.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/reporting-integrity.md) у нас действует строгий запрет на обход проверок безопасности и ограничений песочницы (*«Never: Defeat an access control, permission check, credential requirement, or sandbox restriction...»*).
+  - В системных правилах и [`hooks/pre_tool_guard.py`](file:///usr/local/google/home/jlavrova/.gemini/config/hooks/pre_tool_guard.py) у нас действует строгий запрет на обход проверок безопасности и ограничений песочницы, а [`hooks/chat_lifecycle.py`](file:///usr/local/google/home/jlavrova/.gemini/config/hooks/chat_lifecycle.py) не вызывает `CreateProject`.
   - Для Skia и Flutter Engine мы работаем в локальных git-воркспейсах и git worktree через нативный `swarm` и скрипты без обращения к CoG/Rift API.
 
 #### 3. Встроенный Browser Use в Antigravity
@@ -600,7 +604,7 @@
   - Antigravity анонсировал появление встроенного инструмента управления браузером (browser use) в веб-версии среды.
 - **Вердикт полезности**: `🟡 Уже внедрено у нас`.
 - **Где это реализовано у нас**:
-  - На нашем Cloudtop уже развернут и активно используется полнофункциональный headless Chrome через MCP-сервер `browser_browser` ([`rules/browser_rules.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/browser/rules/browser_rules.md) и [`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/browser/skills/browser_operations/SKILL.md)), а для управления графическим экраном X11/Wayland доступен плагин `cloudtop-use` с `desktopctl`.
+  - На нашем Cloudtop уже развернут и активно используется полнофункциональный headless Chrome через MCP-сервер `browser_browser` ([`plugins/browser/rules/browser_rules.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/browser/rules/browser_rules.md) и [`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/browser/skills/browser_operations/SKILL.md)), а для управления графическим экраном X11/Wayland доступен плагин `cloudtop-use` с `desktopctl`.
 
 #### 4. Активация квот на Argon и Carbon через `go/agy-for-googlers` в личных аккаунтах Antigravity
 - **Авторы**: Adam Rice (`ricea@google.com`, 00:13 ET / 05:13 UTC, тред `spaces/AAQA45T8nC8/threads/Yn2x0EaxLOU`), Ming-Ying Chung (`mych@google.com`, 00:22 ET), Peter Wen (`wnwen@google.com`), Dan Murphy (`dmurph@google.com`), Jan Wilken Dörrie (`jdoerrie@google.com`, 14:42 ET).
@@ -621,7 +625,7 @@
 ### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
 
 #### 1. Утилита персонального ИИ-коучинга `sparkly-agy`
-- **Авторы**: Vadim Ivanov (`vivanov@google.com`, 07:35 ET / 12:35 UTC, тред `spaces/AAAAn_HZbYs/threads/Uy70QwIhMbU`), Michael Golikov (`mgolikov@google.com`), Slava Guzanov (`sguzanov@google.com`).
+- **Авторы**: Vadim Ivanov (`vivanov@google.com`, 07:35 ET / 12:35 UTC, тред `spaces/AAAAn_HZbYs/threads/Uy70QwIhMbU`), Michael Golikov (`golikov@google.com`), Slava Guzanov (`vguzanov@google.com`).
 - **Ссылки**: [go/sparkly-agy](http://goto.google.com/sparkly-agy).
 - **Суть**:
   - Анонсирована внутренняя Jetski-утилита для персонального коучинга и анализа навыков работы с ИИ-агентами («Jetski тулза с персональным коучингом как улучшить свои ai скиллы»).
@@ -640,19 +644,21 @@
 
 ### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
 
-#### 1. Доклад и слайды «JETSKI.EXE — How I actually use Jetski»
+#### 1. Доклад и слайды «JETSKI.EXE — How I actually use Jetski» и личные правила автора
 - **Автор**: Ahmed Raslan (`rslan@google.com`, 11:08 ET / 16:08 UTC, тред `spaces/AAQA45T8nC8/threads/AQ-yZM_WiX0`).
-- **Ссылки и материалы**: Презентация [JETSKI.EXE — How I actually use Jetski (Arabs of Poland AI Coffee Chat #1)](https://docs.google.com/presentation/d/1Q9mrT55DQ-gZLPoJqvo7VYM7opxpnthoc2nFnFJVr6g/edit?slide=id.p&resourcekey=0-u0NotIwBQJQSqSmyEA8C0w#slide=id.p), плагин автора [`/google/src/files/head/depot/google3/experimental/users/rslan/plugins/print_watcher/`](file:///google/src/files/head/depot/google3/experimental/users/rslan/plugins/print_watcher/).
-- **Ключевые инварианты и практики доклада**:
-  1. *Четкое разграничение slash-команд*: слэш-команды в Jetski — это преимущественно текстовые промпт-обертки (`planPrompt` в `slash_command_prompts.go`), прикрепляемые к сообщению пользователя, за исключением `/goal`, имеющей собственный бэкенд-хук. При этом цепочки команд (например, `/plan /grill-me`) парсятся циклом в `step_string_converters.go`, но не гарантируют изолированную обработку.
-  2. *Механика плагинов*: плагин в Jetski представляет собой изолированную директорию с манифестом `plugin.json` и набором `skills/`.
-  3. *CDP-аутентификация без передачи паролей*: плагин `print_watcher` подключается по CDP (`--remote-debugging-port=9222`) к запущенному Chrome инженера и обращается к внутренним SSO-эндпоинтам (`3dprinteros.corp.goog`) без API-токенов.
-  4. *Инвариант «What did you NOT verify»*: обязательное требование честности и верификации фактов — перепроверять утверждения субагентов и моделей по первичным источникам.
-- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
-- **Где это реализовано у нас**:
-  - Принцип строгой верификации и разделения фактов и домыслов зафиксирован в [`rules/reporting-integrity.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/reporting-integrity.md) (*«Keep a clear line between what you observed in real tool output and what you inferred...»*).
-  - Работа с CDP и headless-браузером регламентирована в [`rules/browser_rules.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/browser/rules/browser_rules.md) и MCP-сервере `browser_browser`.
-  - Управление жизненным циклом плагинов и скиллов описано в скиллах `jetski-customizations` и `plugin`.
+- **Ссылки и материалы**: Презентация [JETSKI.EXE — How I actually use Jetski (Arabs of Poland AI Coffee Chat #1)](https://docs.google.com/presentation/d/1Q9mrT55DQ-gZLPoJqvo7VYM7opxpnthoc2nFnFJVr6g/edit?slide=id.p&resourcekey=0-u0NotIwBQJQSqSmyEA8C0w#slide=id.p), плагин автора [`/google/src/files/head/depot/google3/experimental/users/rslan/plugins/print_watcher/`](file:///google/src/files/head/depot/google3/experimental/users/rslan/plugins/print_watcher/), личный конфиг [`/google/src/files/head/depot/configs/users/rslan/_agents/`](file:///google/src/files/head/depot/configs/users/rslan/_agents/).
+- **Ключевые инварианты и практики доклада (включая графические слайды 12–18)**:
+  1. *Epistemic Hygiene (`OBSERVED` / `INFERRED` / `UNVERIFIED` + «What did you NOT verify?»)*: обязательная маркировка статуса утверждений и явный блок `What did you NOT verify?` при сдаче ресерча, аудита или фиксов (перекликается с `Anti-Hallucination Gate` в [`/google/src/files/head/depot/configs/users/behamilton/_agents/AGENTS.md`](file:///google/src/files/head/depot/configs/users/behamilton/_agents/AGENTS.md)).
+  2. *Context Decay Watchdog (Slide 15)*: при 3+ неудачных попытках правки/теста одного файла или разрастании контекста агент обязан остановиться, зафиксировать проверенные факты и отвергнутые гипотезы и передать задачу в чистый субагент/handoff вместо зацикливания.
+  3. *Четкое разграничение slash-команд*: слэш-команды в Jetski — это преимущественно текстовые промпт-обертки (`planPrompt` в [`/google/src/files/head/depot/google3/third_party/jetski/cortex/slash_command_prompts.go`](file:///google/src/files/head/depot/google3/third_party/jetski/cortex/slash_command_prompts.go)), за исключением команды `goal`. Цепочки команд (например, склейка двух слэш-команд подряд) парсятся циклом в [`/google/src/files/head/depot/google3/third_party/jetski/cortex/step_string_converters.go`](file:///google/src/files/head/depot/google3/third_party/jetski/cortex/step_string_converters.go) (`extractLeadingCommands`), склеивая конфликтующие промпты в одно сообщение без пошаговой изоляции.
+  4. *CDP-аутентификация к живому Chrome с SSO*: плагин `print_watcher` подключается по CDP (`--remote-debugging-port=9222`) к запущенному пользовательскому Chrome с активной corp SSO-сессией (`3dprinteros.corp.goog`) без выгрузки кук или паролей.
+- **Вердикт полезности**: `🟡 Частично внедрено у нас + 🟢 Полезно — на выбор (3 конкретных механизма)`.
+- **Где это реализовано у нас и Дельта (чего у нас НЕТ)**:
+  - **Что уже есть**: Требование `file:line` и блок `Not tested:` для тестовых прогонов зафиксированы в [`rules/outgoing_text_verification.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/outgoing_text_verification.md), работа с headless CDP — в [`plugins/browser/rules/browser_rules.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/browser/rules/browser_rules.md).
+  - **Дельта (чего у нас НЕТ)**:
+    1. В промптах наших исследовательских и ревью-субагентов (`keeper_inquisitor`, `keeper_skeptic`, `research-google`) нет обязательного поля **`Не проверено (What was NOT verified):`** для явной фиксации слепых зон аудита (в `outgoing_text_verification.md` `Not tested:` применяется только к тест-сьютам).
+    2. В `rules/subagent_exploration.md` и `hooks/pre_tool_guard.py` нет детектора **3-Strike Same-File Edit/Test Loop** (остановка при 3 подряд неудачных циклах правки/теста одного файла с принудительной фиксацией отвергнутых гипотез).
+    3. В рекомендациях слэш-команд не зафиксировано предупреждение о том, что нельзя склеивать несколько слэш-команд (`/plan /grill-me`) в одном сообщении из-за `extractLeadingCommands`.
 
 #### 2. Демо генерации интерактивов с моделью Carbon
 - **Авторы**: Cheney Tsai (`cheneytsai@google.com`, 16:30 ET / 21:30 UTC, тред `spaces/AAQA45T8nC8/threads/8qN7TpTxmG0`), Andrew Grieve (`agrieve@google.com`).
