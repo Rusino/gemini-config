@@ -145,9 +145,10 @@ TEST_FILE_RE = re.compile(
 BUILD_FILE_RE = re.compile(
     r"(?:\.gni|\.gn|BUILD|BUILD\.bazel|CMakeLists\.txt|\.cmake|\.gyp|DEPS)$"
 )
-# Skia DEF_TEST(Name, ...), gtest TEST(Suite, Name), Python `def test_x`
+# Skia DEF_TEST / UNIX_ONLY_TEST(Name, ...), gtest TEST(Suite, Name), Python `def test_x`
 TEST_DEF_RE = re.compile(
-    r"\b(?:DEF_\w*TEST\w*\(\s*(\w+)|TEST(?:_F|_P)?\(\s*(\w+)\s*,\s*(\w+)|def\s+(test_\w+))"
+    r"\b(?:(?:DEF_\w*TEST\w*|UNIX_ONLY_TEST)\(\s*(\w+)"
+    r"|TEST(?:_F|_P)?\(\s*(\w+)\s*,\s*(\w+)|def\s+(test_\w+))"
 )
 
 

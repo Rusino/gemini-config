@@ -184,6 +184,36 @@ DEF_TEST(FontPinGuarded, reporter) {
       res = self.run_script(tmp, "tests/FontMgrAndroidParserTest.cpp", "FontPinGuarded", log)
       self.assertEqual(res.returncode, 0, res.stdout)
 
+  # Checks that --diff discovers Skia UNIX_ONLY_TEST definitions so SkParagraph
+  # tests are audited for mutation attestation and body liveness instead of skipped
+  def test_unix_only_test_discovered_in_diff_mode(self):
+    unix_body = """
+UNIX_ONLY_TEST(SkParagraph_UnixOnlyExample, reporter) {
+    REPORTER_ASSERT(reporter, 1 == 1);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+      self.make_repo(tmp, unix_body, register_scanner_test=False)
+      missing = self.run_script(tmp, None, None, "Finished!\n", diff="HEAD")
+      self.assertEqual(missing.returncode, 1)
+      self.assertIn("SkParagraph_UnixOnlyExample", missing.stdout)
+      self.assertIn("[NOT RUN]", missing.stdout)
+      self.assertIn("[NO MUTATION ATTESTATION]", missing.stdout)
+      self.attest(tmp, "tests/FontMgrAndroidParserTest.cpp", "SkParagraph_UnixOnlyExample")
+      live_log = (
+          "start unit test SkParagraph_UnixOnlyExample\n"
+          "start unit test FontScanner_FreeType_ScanStyleMatchesMakeFromStream\n"
+          "Finished!\n"
+      )
+      self.attest(
+          tmp, "tests/FontScannerStyleTest.cpp",
+          "FontScanner_FreeType_ScanStyleMatchesMakeFromStream",
+      )
+      with open(os.path.join(tmp, "gn", "tests.gni"), "a") as f:
+        f.write('"$_tests/FontScannerStyleTest.cpp",\n')
+      ok = self.run_script(tmp, None, None, live_log, diff="HEAD")
+      self.assertEqual(ok.returncode, 0, ok.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()
