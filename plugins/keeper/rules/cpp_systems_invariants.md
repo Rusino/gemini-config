@@ -10,9 +10,11 @@ description: "C++ systems invariants for all Skia and engine code."
    `grapheme clusters`, glyph indices, logical vs visual BiDi, `advance` vs `ink bounds`) via `+ 1`
    or `auto`. Use signed `int` + `SkASSERT` for counts with `SkToInt` / `SkTFitsIn` at `size_t` /
    `float` / 64-bit boundaries
-2. **Fail-fast dimensional honesty:** validate untrusted external inputs (public API, font/text
-   data, C/ICU/CoreText responses) at the entry boundary and return cleanly on failure; enforce
-   internal call-chain preconditions with `SkASSERT`, not defensive `if (!ptr) return;`
+2. **Fail-fast dimensional honesty:** validate untrusted external inputs and data-dependent
+   queries (public API, UTF-8/font streams, family/locale lookups) at the boundary and return
+   cleanly on failure; enforce internal preconditions with `SkASSERT`, and C/CF/CoreText
+   allocations or constructors on validated arguments (null only on OOM) with `SkASSERT_RELEASE`
+   (`CHECK` in Chromium), never silent skips, null fallbacks, or defensive `if (!ptr) return;`
 3. **Zero-allocation hot paths:** no `new`, `malloc`, `std::string` copies, growing vectors, or
    `std::map` / `std::unordered_map` in layout and rendering loops
 4. **Loop guards:** every loop provably terminates; data-driven loops over clusters, runs, or
