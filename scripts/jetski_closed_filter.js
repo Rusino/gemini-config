@@ -495,6 +495,14 @@
   let availableModelsFetchedAt = 0;
   let availableModelsFetching = null;
   let lastAppliedModelsFetchedAt = 0;
+  // Caches RetrieveUserQuotaSummary reset timestamps for View Usage and Models & Usage DOM rows
+  const QUOTA_SUMMARY_TTL_MS = 60000;
+  const QUOTA_SUMMARY_RETRY_MS = 10000;
+  const quotaSummaryResetMsByKey = new Map();
+  const quotaSummaryUniqueByLabel = new Map();
+  let quotaSummaryFetchedAt = 0;
+  let quotaSummaryFailedAt = 0;
+  let quotaSummaryFetching = null;
 
   // Numeric codeium_common_pb.Model enum values for non-placeholder model identifiers
   const NAMED_MODEL_ENUM_VALUES = {
@@ -3138,6 +3146,31 @@
           })
           .catch(() => {});
       }
+      if (
+        !disposed &&
+        url.includes('/RetrieveUserQuotaSummary') &&
+        respPromise &&
+        typeof respPromise.then === 'function'
+      ) {
+        respPromise
+          .then((resp) => {
+            if (disposed || !resp || !resp.ok || typeof resp.clone !== 'function') return null;
+            const ct = resp.headers?.get?.('content-type') || '';
+            // Binary protobuf calls force a fresh JSON read on sync instead of stale cached clocks
+            if (ct && !ct.toLowerCase().includes('json')) {
+              quotaSummaryFetchedAt = 0;
+              scheduleSync();
+              return null;
+            }
+            return resp.clone().json();
+          })
+          .then((data) => {
+            if (!disposed && data && ingestQuotaSummaryPayload(data)) {
+              scheduleSync();
+            }
+          })
+          .catch(() => {});
+      }
       return respPromise;
     };
     gatedFetch.__jetskiSoundGate = true;
@@ -3263,18 +3296,365 @@
   }
 
   const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const MONTH_SHORT = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+  ];
+  const QUOTA_REL_TAG_RE = new RegExp(
+    '(?:^|\\s*[·,;—-]\\s*|\\s+)' +
+      '(?:(?:your\\s+[\\w-]+\\s+limit\\s+|it\\s+)?will\\s+(?:fully\\s+)?refresh|' +
+      'refresh(?:es)?|resets?)\\s+in\\s+' +
+      '(?:less\\s+than\\s+(?:a|1)\\s+minute|<\\s*1m|\\d+\\s*[dhms](?:\\s*\\d+\\s*[dhms])*|' +
+      '\\d+\\s+(?:day|hour|minute|second)s?(?:\\s*,\\s*\\d+\\s+(?:day|hour|minute|second)s?)*)\\.?',
+    'gi'
+  );
+  const QUOTA_PANEL_SUBTEXT_RE =
+    /^(.*,\s*)?(Resets|resets)\s+in\s+(?:<\s*1m|\d+[dhms](?:\s+\d+[hms])*)$/;
+  const QUOTA_CARD_DESC_REL_RE = new RegExp(
+    '((?:will\\s+(?:fully\\s+)?refresh|refresh(?:es)?|resets?)\\s+)in\\s+' +
+      '(?:less\\s+than\\s+(?:a|1)\\s+minute|<\\s*1m|' +
+      '\\d+\\s+(?:day|hour|minute|second)s?(?:\\s*,\\s*\\d+\\s+(?:day|hour|minute|second)s?)*)',
+    'gi'
+  );
+  const QUOTA_SUBTEXT_MARKER_ATTR = 'data-jetski-quota-subtext';
 
-  // Formats a future quota reset as browser-local HH:MM, or Ddd HH:MM on another local day;
-  // absolute clocks stay true between enrichments, unlike a relative countdown
+  // Formats a future quota reset as local HH:MM, Ddd HH:MM (<6 days), or Mon D, HH:MM (>=6 days)
   function formatQuotaResetClock(resetMs) {
     const now = Date.now();
     if (!resetMs || resetMs <= now) return '';
+    const nowDate = new Date(now);
     const at = new Date(resetMs);
-    const clock = `${String(at.getHours()).padStart(2, '0')}:` +
+    const clock =
+      `${String(at.getHours()).padStart(2, '0')}:` +
       String(at.getMinutes()).padStart(2, '0');
-    return at.toDateString() === new Date(now).toDateString()
-      ? clock
-      : `${WEEKDAY_SHORT[at.getDay()]} ${clock}`;
+    const startToday = new Date(
+      nowDate.getFullYear(),
+      nowDate.getMonth(),
+      nowDate.getDate()
+    ).getTime();
+    const startAt = new Date(at.getFullYear(), at.getMonth(), at.getDate()).getTime();
+    const dayDiff = Math.round((startAt - startToday) / 86400000);
+    if (dayDiff === 0) return clock;
+    if (dayDiff > 0 && dayDiff < 6) return `${WEEKDAY_SHORT[at.getDay()]} ${clock}`;
+    return `${MONTH_SHORT[at.getMonth()]} ${at.getDate()}, ${clock}`;
+  }
+
+  // Drops server relative countdown clauses once an exact resetClock replaces them
+  function stripRelativeResetText(rawDesc) {
+    if (!rawDesc) return '';
+    return rawDesc
+      .replace(QUOTA_REL_TAG_RE, '')
+      .replace(/^[\s·,;—-]+|[\s·,;—-]+$/g, '');
+  }
+
+  function normalizeQuotaKey(val) {
+    return typeof val === 'string' ? val.trim().toLowerCase() : '';
+  }
+
+  // Mirrors agent_ui_toolkit quotaUtils.formatQuotaWindowLabel for bucket lookup
+  function formatQuotaWindowLabel(bucket) {
+    const win = typeof bucket?.window === 'string' ? bucket.window.trim().toLowerCase() : '';
+    if (win === 'daily') return 'Daily limit';
+    if (win === 'weekly') return 'Weekly limit';
+    if (/^\d+[smhd]$/.test(win)) return `${win} limit`;
+    return typeof bucket?.displayName === 'string' ? bucket.displayName.trim() : '';
+  }
+
+  function recordUniqueQuotaLabel(labelKey, resetMs) {
+    if (!labelKey) return;
+    if (!quotaSummaryUniqueByLabel.has(labelKey)) {
+      quotaSummaryUniqueByLabel.set(labelKey, resetMs);
+      return;
+    }
+    if (quotaSummaryUniqueByLabel.get(labelKey) !== resetMs) {
+      quotaSummaryUniqueByLabel.set(labelKey, -1);
+    }
+  }
+
+  // Indexes RetrieveUserQuotaSummary bucket resetTime values by (group, bucket) and unique label
+  function ingestQuotaSummaryPayload(raw) {
+    const payload = raw?.response && typeof raw.response === 'object' ? raw.response : raw;
+    if (!payload || typeof payload !== 'object') return false;
+    const rawGroups = Array.isArray(payload.groups) ? payload.groups : null;
+    const fallbackBuckets = Array.isArray(payload.buckets) ? payload.buckets : null;
+    if (!rawGroups && !fallbackBuckets) return false;
+    const groups =
+      rawGroups || (fallbackBuckets ? [{ displayName: '', buckets: fallbackBuckets }] : []);
+
+    quotaSummaryResetMsByKey.clear();
+    quotaSummaryUniqueByLabel.clear();
+    for (const group of groups) {
+      if (!group || typeof group !== 'object') continue;
+      const gKey = normalizeQuotaKey(group.displayName);
+      const buckets = Array.isArray(group.buckets) ? group.buckets : [];
+      for (const bucket of buckets) {
+        if (!bucket || typeof bucket !== 'object') continue;
+        const resetMs = parseQuotaResetMs(bucket.resetTime);
+        if (!resetMs) continue;
+        const winKey = normalizeQuotaKey(formatQuotaWindowLabel(bucket));
+        const nameKey = normalizeQuotaKey(bucket.displayName);
+        const descKey = normalizeQuotaKey(bucket.description);
+        if (winKey) {
+          quotaSummaryResetMsByKey.set(`${gKey}\u0000${winKey}`, resetMs);
+          recordUniqueQuotaLabel(winKey, resetMs);
+        }
+        if (nameKey) {
+          quotaSummaryResetMsByKey.set(`${gKey}\u0000${nameKey}`, resetMs);
+          recordUniqueQuotaLabel(nameKey, resetMs);
+        }
+        if (buckets.length === 1 && gKey) {
+          quotaSummaryResetMsByKey.set(`${gKey}\u0000`, resetMs);
+          recordUniqueQuotaLabel(gKey, resetMs);
+        }
+        if (descKey) {
+          quotaSummaryResetMsByKey.set(`${gKey}\u0000desc:${descKey}`, resetMs);
+        }
+      }
+    }
+    quotaSummaryFetchedAt = Date.now();
+    quotaSummaryFailedAt = 0;
+    return true;
+  }
+
+  // Fetches RetrieveUserQuotaSummary as JSON when DOM shows relative times and cache is stale
+  async function ensureQuotaSummaryLoaded() {
+    const now = Date.now();
+    if (quotaSummaryFetchedAt > 0 && now - quotaSummaryFetchedAt < QUOTA_SUMMARY_TTL_MS) {
+      return;
+    }
+    if (quotaSummaryFailedAt && now - quotaSummaryFailedAt < QUOTA_SUMMARY_RETRY_MS) {
+      return;
+    }
+    if (quotaSummaryFetching) return quotaSummaryFetching;
+    const fetchFn = window.fetch?.__jetskiOrigFetch || window.fetch;
+    if (typeof fetchFn !== 'function') return;
+
+    quotaSummaryFetching = (async () => {
+      try {
+        const url = resolveApiUrl(
+          '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary'
+        );
+        const resp = await fetchFn.call(window, url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-codeium-csrf-token': getCsrfToken(),
+          },
+          body: '{"forceRefresh":false}',
+        });
+        if (!resp || !resp.ok) {
+          quotaSummaryFailedAt = Date.now();
+          return;
+        }
+        const data = await resp.json();
+        if (!disposed && data && ingestQuotaSummaryPayload(data)) {
+          scheduleSync();
+        } else {
+          quotaSummaryFailedAt = Date.now();
+        }
+      } catch {
+        quotaSummaryFailedAt = Date.now();
+      } finally {
+        quotaSummaryFetching = null;
+      }
+    })();
+    return quotaSummaryFetching;
+  }
+
+  function getQuotaGroupHeading(ancestor) {
+    const headings = ancestor?.querySelectorAll?.('h3');
+    // Stop before climbing into a shared Settings container with multiple QuotaCards
+    if (!headings || headings.length !== 1) return '';
+    const h3 = headings[0];
+    for (const sp of h3.querySelectorAll?.('span') || []) {
+      const txt = normalizeQuotaKey(sp.textContent);
+      if (txt) return txt;
+    }
+    return normalizeQuotaKey(h3.textContent);
+  }
+
+  // Resolves bucket resetMs from ModelQuotaPanel (QuotaBucketRow) or QuotaCard (SettingsRow) DOM
+  function lookupQuotaSummaryResetMs(spanEl, origText, detailPrefix) {
+    if (quotaSummaryResetMsByKey.size === 0) return 0;
+    const parent = spanEl?.parentElement;
+    if (!parent) return 0;
+
+    // ModelQuotaPanel QuotaBucketRow holds title in first span and optional group in [role="group"]
+    const firstChildText = normalizeQuotaKey(parent.children?.[0]?.textContent);
+    const groupEl = typeof parent.closest === 'function' ? parent.closest('[role="group"]') : null;
+    if (groupEl) {
+      let groupName = '';
+      for (const ch of groupEl.children || []) {
+        if (ch !== parent && !ch.querySelector?.('span.text-muted-foreground')) {
+          groupName = normalizeQuotaKey(ch.textContent);
+          if (groupName) break;
+        }
+      }
+      const exact = quotaSummaryResetMsByKey.get(`${groupName}\u0000${firstChildText}`);
+      if (exact) return exact;
+    }
+
+    const detailKey = normalizeQuotaKey(detailPrefix);
+    if (firstChildText && detailKey) {
+      const singleWithDetail = quotaSummaryResetMsByKey.get(`${firstChildText}\u0000${detailKey}`);
+      if (singleWithDetail) return singleWithDetail;
+    }
+    if (firstChildText) {
+      const singleGroup = quotaSummaryResetMsByKey.get(`${firstChildText}\u0000`);
+      if (singleGroup) return singleGroup;
+      const ungrouped = quotaSummaryResetMsByKey.get(`\u0000${firstChildText}`);
+      if (ungrouped) return ungrouped;
+    }
+
+    // Settings -> Models & Usage (QuotaCard -> SettingsSection -> h3 + SettingsRow)
+    let sectionGroup = '';
+    let cur = parent;
+    for (let depth = 0; cur && depth < 6; depth++) {
+      const h3Name = getQuotaGroupHeading(cur);
+      if (h3Name) {
+        sectionGroup = h3Name;
+        break;
+      }
+      cur = cur.parentElement;
+    }
+    if (sectionGroup && firstChildText) {
+      const cardMatch = quotaSummaryResetMsByKey.get(`${sectionGroup}\u0000${firstChildText}`);
+      if (cardMatch) return cardMatch;
+    }
+    const descKey = normalizeQuotaKey(origText);
+    if (descKey) {
+      const descMatch = quotaSummaryResetMsByKey.get(`${sectionGroup}\u0000desc:${descKey}`);
+      if (descMatch) return descMatch;
+    }
+
+    const uniq = quotaSummaryUniqueByLabel.get(firstChildText);
+    if (uniq && uniq > 0) return uniq;
+    if (detailKey) {
+      const uniqDetail = quotaSummaryUniqueByLabel.get(detailKey);
+      if (uniqDetail && uniqDetail > 0) return uniqDetail;
+    }
+    return 0;
+  }
+
+  function formatQuotaSubtextWithClock(origText, resetClock) {
+    if (!origText || !resetClock) return '';
+    const panelMatch = origText.match(QUOTA_PANEL_SUBTEXT_RE);
+    if (panelMatch) {
+      const prefix = panelMatch[1] || '';
+      const verb = panelMatch[2];
+      return `${prefix}${verb} ${resetClock}`;
+    }
+    QUOTA_CARD_DESC_REL_RE.lastIndex = 0;
+    if (QUOTA_CARD_DESC_REL_RE.test(origText)) {
+      QUOTA_CARD_DESC_REL_RE.lastIndex = 0;
+      const prep = /^\d/.test(resetClock) ? 'at' : 'on';
+      return origText.replace(
+        QUOTA_CARD_DESC_REL_RE,
+        (_, lead) => `${lead}${prep} ${resetClock}`
+      );
+    }
+    return '';
+  }
+
+  // Rewrites relative View Usage and Models & Usage reset strings to exact local wall-clock times
+  function syncQuotaSummaryDom() {
+    const spans = document.querySelectorAll(
+      `span.text-muted-foreground, [${QUOTA_SUBTEXT_MARKER_ATTR}]`
+    );
+    let needsFetch = false;
+    const now = Date.now();
+    const cacheStale =
+      quotaSummaryFetchedAt === 0 || now - quotaSummaryFetchedAt >= QUOTA_SUMMARY_TTL_MS;
+
+    for (const spanEl of spans) {
+      const curText = typeof spanEl.textContent === 'string' ? spanEl.textContent : '';
+      const stashedOrig = spanEl.__jetskiOrigQuotaSubtext;
+      const stashedWritten = spanEl.__jetskiWrittenQuotaSubtext;
+
+      // Keep raw React text as origin whenever React overwrites our formatted clock string
+      let origText = curText;
+      if (stashedOrig && curText === stashedWritten) {
+        origText = stashedOrig;
+      } else {
+        QUOTA_CARD_DESC_REL_RE.lastIndex = 0;
+        const isRelative =
+          QUOTA_PANEL_SUBTEXT_RE.test(curText) || QUOTA_CARD_DESC_REL_RE.test(curText);
+        if (!isRelative) {
+          if (spanEl.hasAttribute?.(QUOTA_SUBTEXT_MARKER_ATTR)) {
+            spanEl.removeAttribute(QUOTA_SUBTEXT_MARKER_ATTR);
+            delete spanEl.__jetskiOrigQuotaSubtext;
+            delete spanEl.__jetskiWrittenQuotaSubtext;
+          }
+          continue;
+        }
+        spanEl.__jetskiOrigQuotaSubtext = curText;
+      }
+
+      if (cacheStale) {
+        needsFetch = true;
+      }
+
+      const panelMatch = origText.match(QUOTA_PANEL_SUBTEXT_RE);
+      const detailPrefix = panelMatch?.[1] ? panelMatch[1].replace(/,\s*$/, '').trim() : '';
+      const resetMs = lookupQuotaSummaryResetMs(spanEl, origText, detailPrefix);
+      const resetClock = formatQuotaResetClock(resetMs);
+      if (!resetClock) {
+        if (resetMs > 0) {
+          // Restore original text on expiration instead of leaving a past clock frozen in the DOM
+          if (spanEl.hasAttribute?.(QUOTA_SUBTEXT_MARKER_ATTR)) {
+            spanEl.removeAttribute(QUOTA_SUBTEXT_MARKER_ATTR);
+            delete spanEl.__jetskiOrigQuotaSubtext;
+            delete spanEl.__jetskiWrittenQuotaSubtext;
+            if (curText !== origText) spanEl.textContent = origText;
+          }
+          if (now - quotaSummaryFetchedAt >= QUOTA_SUMMARY_RETRY_MS) {
+            quotaSummaryFetchedAt = 0;
+            needsFetch = true;
+          }
+        } else if (cacheStale) {
+          needsFetch = true;
+        }
+        continue;
+      }
+
+      const nextText = formatQuotaSubtextWithClock(origText, resetClock);
+      if (!nextText) continue;
+
+      spanEl.__jetskiOrigQuotaSubtext = origText;
+      spanEl.__jetskiWrittenQuotaSubtext = nextText;
+      if (!spanEl.hasAttribute?.(QUOTA_SUBTEXT_MARKER_ATTR)) {
+        spanEl.setAttribute?.(QUOTA_SUBTEXT_MARKER_ATTR, '1');
+      }
+      if (curText !== nextText) {
+        spanEl.textContent = nextText;
+      }
+    }
+
+    if (needsFetch) {
+      void ensureQuotaSummaryLoaded();
+    }
+  }
+
+  function restoreQuotaSummaryDom() {
+    for (const spanEl of document.querySelectorAll(`[${QUOTA_SUBTEXT_MARKER_ATTR}]`)) {
+      const origText = spanEl.__jetskiOrigQuotaSubtext;
+      spanEl.removeAttribute?.(QUOTA_SUBTEXT_MARKER_ATTR);
+      delete spanEl.__jetskiOrigQuotaSubtext;
+      delete spanEl.__jetskiWrittenQuotaSubtext;
+      if (typeof origText === 'string' && spanEl.textContent !== origText) {
+        spanEl.textContent = origText;
+      }
+    }
   }
 
   // Computes effective remaining quota fraction [0.0, 1.0] handling Protobuf3 0.0 omission
@@ -3326,7 +3706,8 @@
     const tagTitle = rawTitle ? `${rawTitle} · ${pill}` : pill;
     const descParts = [`${pct}% quota left`];
     if (resetClock) descParts.push(`resets ${resetClock}`);
-    const fallbackDesc = rawDesc || (typeof modelId === 'string' ? modelId.trim() : '');
+    const cleanedDesc = resetClock ? stripRelativeResetText(rawDesc) : rawDesc;
+    const fallbackDesc = cleanedDesc || (typeof modelId === 'string' ? modelId.trim() : '');
     if (fallbackDesc) descParts.push(fallbackDesc);
     return { tagTitle, tagDescription: descParts.join(' · ') };
   }
@@ -15029,6 +15410,8 @@
     ensureLiveProgressTicker(hasActive);
     // Enhance native conversation navigator cards (TurnHoverCard and GroupHoverCard)
     enhanceNativeNavigatorCards();
+    // Rewrite View Usage and Models & Usage relative reset text to exact local clocks
+    syncQuotaSummaryDom();
     // Synchronize chain stars and read-only piece locks across open conversation views
     void syncConversationChainNavigators();
   }
@@ -15054,6 +15437,8 @@
         target.id === STAR_TOOLTIP_ID ||
         target.id === AUTOPILOT_TOAST_ID ||
         target.id === FLIGHT_DECK_DRAWER_ID ||
+        (target.hasAttribute?.(QUOTA_SUBTEXT_MARKER_ATTR) &&
+          target.textContent === target.__jetskiWrittenQuotaSubtext) ||
         target.className === BAR_CLASS ||
         target.className === TITLEBAR_REMINDER_BTN_CLASS ||
         target.className === INBOX_REMINDER_BTN_CLASS ||
@@ -15339,6 +15724,12 @@
         }
       }
     }
+    restoreQuotaSummaryDom();
+    quotaSummaryResetMsByKey.clear();
+    quotaSummaryUniqueByLabel.clear();
+    quotaSummaryFetchedAt = 0;
+    quotaSummaryFailedAt = 0;
+    quotaSummaryFetching = null;
     const bubble = document.getElementById('jetski-closed-chats-filter-bubble');
     if (bubble) {
       bubble.remove();

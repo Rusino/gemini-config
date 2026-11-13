@@ -3634,6 +3634,520 @@ global.requestAnimationFrame = () => 1;
     )
     self.assertIn("MODEL_PICKER_ENRICHMENT_PASSED", res.stdout)
 
+  def test_model_quota_summary_reset_clock(self) -> None:
+    """Verifies exact reset clocks in View Usage, Models & Usage, and tag descriptions."""
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+  }
+  get textContent() { return this._textContent; }
+  set textContent(v) { this._textContent = String(v); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(c) { c.parentElement = this; this.children.push(c); return c; }
+  insertBefore(c, ref) { c.parentElement = this; this.children.push(c); return c; }
+  remove() {
+    if (!this.parentElement) return;
+    const i = this.parentElement.children.indexOf(this);
+    if (i !== -1) this.parentElement.children.splice(i, 1);
+    this.parentElement = null;
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  matches(sel) {
+    const s = sel.trim();
+    if (!s) return false;
+    if (s === 'button[aria-label="Display Options"]') {
+      return this.tagName === 'BUTTON' && this.getAttribute('aria-label') === 'Display Options';
+    }
+    if (s === '[role="group"]') return this.getAttribute('role') === 'group';
+    if (s === '[data-jetski-quota-subtext]') return this.hasAttribute('data-jetski-quota-subtext');
+    if (s === 'span.text-muted-foreground') {
+      return (
+        this.tagName === 'SPAN' &&
+        this.className.split(/\s+/).includes('text-muted-foreground')
+      );
+    }
+    if (s.startsWith('#')) return this.id === s.slice(1);
+    if (s.startsWith('.')) return this.className.split(/\s+/).includes(s.slice(1));
+    return this.tagName === s.toUpperCase();
+  }
+  closest(sel) {
+    let cur = this;
+    while (cur) {
+      if (cur.matches(sel)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  querySelector(s) { return this.querySelectorAll(s)[0] || null; }
+  querySelectorAll(s) {
+    if (typeof s === 'string' && s.includes(',')) {
+      const seen = new Set();
+      return s
+        .split(',')
+        .flatMap((p) => this.querySelectorAll(p.trim()))
+        .filter((el) => (seen.has(el) ? false : seen.add(el)));
+    }
+    const out = [];
+    const visit = (n) => {
+      for (const c of n.children) {
+        if (c.matches(s)) out.push(c);
+        visit(c);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+const actionRow = new FakeElement('div');
+const displayOptionsBtn = new FakeElement('button');
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+actionRow.appendChild(displayOptionsBtn);
+bodyEl.appendChild(actionRow);
+
+// Pin EDT/EST boundary across 2026-11-01 DST fallback
+process.env.TZ = 'America/New_York';
+let nowMs = Date.parse('2026-10-29T18:30:00Z');
+Date.now = () => nowMs;
+
+const protoMarker = { __isBufProto: true };
+function protoObj(typeName, fields) {
+  return Object.assign(Object.create(protoMarker), { $typeName: typeName, ...fields });
+}
+
+function makeQuotaConfig(label, enumVal, modelId, remaining, resetIso, tagDesc = '') {
+  return protoObj('exa.codeium_common_pb.ClientModelConfig', {
+    label,
+    modelOrAlias: protoObj('exa.codeium_common_pb.ModelOrAlias', {
+      choice: { case: 'model', value: enumVal },
+    }),
+    disabled: false,
+    quotaInfo: protoObj('exa.codeium_common_pb.QuotaInfo', {
+      remainingFraction: remaining,
+      resetTime: resetIso,
+    }),
+    tagTitle: '',
+    tagDescription: tagDesc,
+    modelId,
+  });
+}
+
+const storeState = {
+  trajectorySummaries: { summaries: {} },
+  userStatus: protoObj('exa.codeium_common_pb.UserStatus', {
+    cascadeModelConfigData: protoObj('exa.codeium_common_pb.CascadeModelConfigData', {
+      clientModelConfigs: [
+        makeQuotaConfig(
+          'Gemini Pro Next',
+          1260,
+          'gemini-pro-coordinator',
+          0.15,
+          '2026-10-29T21:02:00Z',
+          'Pro pool · Resets in 4h 2m'
+        ),
+        makeQuotaConfig(
+          'Gemini 3.8 Flash (High)',
+          1318,
+          'gemini-3.8-flash-high',
+          0.18,
+          '2026-11-05T19:00:00Z',
+          'You have hit your weekly limit, it will refresh in 7 days, 0 hours.'
+        ),
+        makeQuotaConfig(
+          'Gemini 3.8 Flash (Medium)',
+          1319,
+          'gemini-3.8-flash-medium',
+          0.22,
+          '2026-11-04T19:00:00Z',
+          'Resets in 6d'
+        ),
+        Object.assign(
+          makeQuotaConfig(
+            'Gemini OneQuota',
+            1320,
+            'gemini-onequota',
+            0.1,
+            '2026-10-29T21:02:00Z',
+            'OneQuota · Resets in 4h 2m'
+          ),
+          { tagTitle: 'OneQuota' }
+        ),
+      ],
+      clientModelSorts: [],
+    }),
+  }),
+};
+
+const reduxStore = {
+  getState() { return storeState; },
+  dispatch(action) {
+    if (action?.type === 'userStatus/setUserStatus') {
+      storeState.userStatus = action.payload;
+    }
+    return action;
+  },
+  subscribe() { return () => {}; },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+const summaryPayload = {
+  response: {
+    groups: [
+      {
+        displayName: 'Claude Opus 5.5',
+        buckets: [
+          {
+            bucketId: '3p-20h',
+            displayName: '20h limit',
+            description: 'You have hit your 5-hour limit, it will refresh in 2 hours, 32 minutes.',
+            window: '20h',
+            remainingFraction: 0.4,
+            resetTime: '2026-10-29T21:02:00Z',
+          },
+        ],
+      },
+      {
+        displayName: 'Gemini Pro',
+        buckets: [
+          {
+            bucketId: 'gemini-daily',
+            displayName: 'Daily Limit',
+            description: 'Daily limit refreshes in 19 hours, 30 minutes.',
+            window: 'daily',
+            remainingFraction: 0.8,
+            resetTime: '2026-10-30T12:30:00Z',
+          },
+          {
+            bucketId: 'gemini-weekly',
+            displayName: 'Weekly Limit',
+            description:
+              'You have used some of your weekly limit, ' +
+              'it will fully refresh in 4 days, 21 hours.',
+            window: 'weekly',
+            remainingFraction: 0.5,
+            resetTime: '2026-11-03T14:00:00Z',
+          },
+        ],
+      },
+      {
+        displayName: 'Gemini Weekly 7d',
+        buckets: [
+          {
+            bucketId: 'gemini-7d',
+            displayName: 'Weekly Limit',
+            description: 'Weekly limit',
+            window: '',
+            remainingFraction: 0.2,
+            resetTime: '2026-11-05T19:00:00Z',
+          },
+        ],
+      },
+    ],
+  },
+};
+
+function makeBucketRow(titleText, secondaryText) {
+  const row = new FakeElement('div');
+  row.setAttribute('class', 'grid grid-cols-[minmax(0,1fr)_auto] items-center');
+  const titleSpan = new FakeElement('span');
+  titleSpan.setAttribute('class', 'truncate text-foreground');
+  titleSpan.textContent = titleText;
+  const pctSpan = new FakeElement('span');
+  pctSpan.setAttribute('class', 'flex items-center justify-end gap-1.5');
+  const subSpan = new FakeElement('span');
+  subSpan.setAttribute('class', 'col-span-2 truncate text-muted-foreground');
+  subSpan.textContent = secondaryText;
+  row.appendChild(titleSpan);
+  row.appendChild(pctSpan);
+  row.appendChild(subSpan);
+  return { row, subSpan };
+}
+
+function makeQuotaCardSection(groupTitle, rowsSpec) {
+  const section = new FakeElement('div');
+  section.setAttribute('class', 'space-y-2');
+  const h3 = new FakeElement('h3');
+  const h3Wrap = new FakeElement('div');
+  const h3Text = new FakeElement('span');
+  h3Text.textContent = groupTitle;
+  h3Wrap.appendChild(h3Text);
+  h3.appendChild(h3Wrap);
+  section.appendChild(h3);
+  const card = new FakeElement('div');
+  section.appendChild(card);
+  const descSpans = [];
+  for (const [labelText, descText] of rowsSpec) {
+    const settingsRow = new FakeElement('div');
+    const col = new FakeElement('div');
+    col.setAttribute('class', 'flex-1 flex flex-col gap-0.5');
+    const labelWrap = new FakeElement('div');
+    const labelSpan = new FakeElement('span');
+    labelSpan.textContent = labelText;
+    labelWrap.appendChild(labelSpan);
+    const descSpan = new FakeElement('span');
+    descSpan.setAttribute('class', 'text-sm text-muted-foreground whitespace-pre-wrap');
+    descSpan.textContent = descText;
+    col.appendChild(labelWrap);
+    col.appendChild(descSpan);
+    settingsRow.appendChild(col);
+    card.appendChild(settingsRow);
+    descSpans.push(descSpan);
+  }
+  return { section, descSpans };
+}
+
+// Mount ModelQuotaPanel (single-bucket, multi-bucket, and >=6d) + QuotaCard DOM
+const opusRow = makeBucketRow('Claude Opus 5.5', '20h limit, resets in 4h 2m');
+bodyEl.appendChild(opusRow.row);
+
+const geminiGroup = new FakeElement('div');
+geminiGroup.setAttribute('role', 'group');
+const geminiLabel = new FakeElement('div');
+geminiLabel.textContent = 'Gemini Pro';
+const geminiDailyRow = makeBucketRow('Daily limit', 'Resets in 19h 30m');
+const geminiWeeklyRow = makeBucketRow('Weekly limit', 'Resets in 4d 21h');
+geminiGroup.appendChild(geminiLabel);
+geminiGroup.appendChild(geminiDailyRow.row);
+geminiGroup.appendChild(geminiWeeklyRow.row);
+bodyEl.appendChild(geminiGroup);
+
+const weekly7dRow = makeBucketRow('Gemini Weekly 7d', 'Resets in 7d');
+bodyEl.appendChild(weekly7dRow.row);
+
+const opusCard = makeQuotaCardSection('Claude Opus 5.5', [
+  ['20h limit', 'You have hit your 5-hour limit, it will refresh in 2 hours, 32 minutes.'],
+]);
+const geminiCard = makeQuotaCardSection('Gemini Pro', [
+  [
+    'Weekly Limit',
+    'You have used some of your weekly limit, it will fully refresh in 4 days, 21 hours.',
+  ],
+]);
+bodyEl.appendChild(opusCard.section);
+bodyEl.appendChild(geminiCard.section);
+
+let quotaJsonFetches = 0;
+let summaryContentType = 'application/proto';
+global.window = {
+  innerWidth: 1280,
+  location: { pathname: '/', search: '' },
+  __APP_CONFIG__: { csrfToken: 'csrf-quota-summary' },
+  localStorage: { getItem: () => null, setItem: () => {} },
+  fetch: async (url, opts) => {
+    const u = String(url);
+    if (u.includes('GetAvailableModels')) {
+      return { ok: true, json: async () => ({ response: { models: {} } }) };
+    }
+    if (u.includes('RetrieveUserQuotaSummary')) {
+      const hdrs = opts?.headers || {};
+      const reqCt = String(hdrs['Content-Type'] || hdrs['content-type'] || '');
+      if (reqCt.includes('json') || summaryContentType.includes('json')) {
+        quotaJsonFetches++;
+        return {
+          ok: true,
+          headers: { get: () => 'application/json' },
+          clone() { return this; },
+          json: async () => summaryPayload,
+        };
+      }
+      return {
+        ok: true,
+        headers: { get: () => summaryContentType },
+        clone() { return this; },
+        json: async () => { throw new SyntaxError('Unexpected token'); },
+      };
+    }
+    return { ok: false, status: 404 };
+  },
+};
+
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  activeElement: null,
+  getElementById(id) { return docEl.querySelector(`#${id}`); },
+  createElement(t) { return new FakeElement(t); },
+  querySelector(s) { return docEl.querySelector(s); },
+  querySelectorAll(s) { return docEl.querySelectorAll(s); },
+  addEventListener() {},
+  removeEventListener() {},
+};
+let rafQueue = [];
+let observerCb = null;
+global.MutationObserver = class {
+  constructor(cb) { observerCb = cb; }
+  observe() {}
+  disconnect() {}
+};
+global.requestAnimationFrame = (fn) => { rafQueue.push(fn); return rafQueue.length; };
+
+function flushRaf() {
+  while (rafQueue.length > 0) rafQueue.shift()();
+}
+
+(async () => {
+  eval(code);
+  await new Promise((r) => setImmediate(r));
+  flushRaf();
+  await new Promise((r) => setImmediate(r));
+  flushRaf();
+
+  // Tag descriptions strip relative phrases when exact resetClock is formatted
+  const configs = storeState.userStatus.cascadeModelConfigData.clientModelConfigs;
+  const proCfg = configs.find((c) => c.modelId === 'gemini-pro-coordinator');
+  assert(proCfg.tagDescription.includes('resets 17:02'), proCfg.tagDescription);
+  assert(proCfg.tagDescription.includes('Pro pool'), proCfg.tagDescription);
+  assert(!/resets\s+in/i.test(proCfg.tagDescription), proCfg.tagDescription);
+
+  // Resets >= 6 days or same weekday next week include short month+day (Nov 4/5, 14:00)
+  const sevenDayCfg = configs.find((c) => c.modelId === 'gemini-3.8-flash-high');
+  assert.strictEqual(sevenDayCfg.tagTitle, '18% ↻Nov 5, 14:00');
+  assert(sevenDayCfg.tagDescription.includes('resets Nov 5, 14:00'), sevenDayCfg.tagDescription);
+  assert(!/refresh\s+in/i.test(sevenDayCfg.tagDescription), sevenDayCfg.tagDescription);
+  const sixDayCfg = configs.find((c) => c.modelId === 'gemini-3.8-flash-medium');
+  assert.strictEqual(sixDayCfg.tagTitle, '22% ↻Nov 4, 14:00');
+  const oqCfg = configs.find((c) => c.modelId === 'gemini-onequota');
+  assert.strictEqual(oqCfg.tagTitle, 'OneQuota');
+  assert.strictEqual(oqCfg.tagDescription, 'OneQuota · Resets in 4h 2m');
+
+  // Fallback JSON fetch populates ModelQuotaPanel & QuotaCard clocks even if app uses proto
+  assert(quotaJsonFetches >= 1, 'Expected JSON RetrieveUserQuotaSummary fallback fetch');
+  assert.strictEqual(opusRow.subSpan.textContent, '20h limit, resets 17:02');
+  assert.strictEqual(geminiDailyRow.subSpan.textContent, 'Resets Fri 08:30');
+  assert.strictEqual(geminiWeeklyRow.subSpan.textContent, 'Resets Tue 09:00');
+  assert.strictEqual(weekly7dRow.subSpan.textContent, 'Resets Nov 5, 14:00');
+  assert.strictEqual(
+    opusCard.descSpans[0].textContent,
+    'You have hit your 5-hour limit, it will refresh at 17:02.'
+  );
+  assert.strictEqual(
+    geminiCard.descSpans[0].textContent,
+    'You have used some of your weekly limit, it will fully refresh on Tue 09:00.'
+  );
+
+  // Cleanup restores original relative DOM subtexts and clears marker attributes
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(opusRow.subSpan.textContent, '20h limit, resets in 4h 2m');
+  assert.strictEqual(geminiDailyRow.subSpan.textContent, 'Resets in 19h 30m');
+  assert.strictEqual(geminiWeeklyRow.subSpan.textContent, 'Resets in 4d 21h');
+  assert.strictEqual(weekly7dRow.subSpan.textContent, 'Resets in 7d');
+  assert.strictEqual(
+    geminiCard.descSpans[0].textContent,
+    'You have used some of your weekly limit, it will fully refresh in 4 days, 21 hours.'
+  );
+  assert.strictEqual(docEl.querySelectorAll('[data-jetski-quota-subtext]').length, 0);
+
+  // Re-inject with direct Connect JSON RetrieveUserQuotaSummary (zero extra fallback fetch)
+  opusRow.row.remove();
+  geminiGroup.remove();
+  weekly7dRow.row.remove();
+  opusCard.section.remove();
+  geminiCard.section.remove();
+  summaryContentType = 'application/json';
+  const fetchesBeforeJson = quotaJsonFetches;
+  eval(code);
+  await window.fetch('/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{"forceRefresh":true}',
+  });
+  await new Promise((r) => setImmediate(r));
+  bodyEl.appendChild(opusRow.row);
+  // Trigger MutationObserver sync without any extra fallback fetch
+  observerCb([{ target: bodyEl }]);
+  flushRaf();
+  assert.strictEqual(quotaJsonFetches, fetchesBeforeJson + 1);
+  assert.strictEqual(opusRow.subSpan.textContent, '20h limit, resets 17:02');
+
+  // Expired resetMs restores original text immediately instead of freezing a past clock
+  nowMs = Date.parse('2026-10-29T21:05:00Z');
+  observerCb([{ target: bodyEl }]);
+  flushRaf();
+  assert.strictEqual(opusRow.subSpan.textContent, '20h limit, resets in 4h 2m');
+  window.__jetskiClosedChatsFilterCleanup();
+
+  // Empty { groups: [] } RetrieveUserQuotaSummary must not spin fetch loops within TTL
+  const emptySummary = { response: { groups: [] } };
+  const origFetch = global.window.fetch;
+  let emptyFetches = 0;
+  global.window.fetch = async (url, opts) => {
+    if (String(url).includes('RetrieveUserQuotaSummary')) {
+      emptyFetches++;
+      return {
+        ok: true,
+        headers: { get: () => 'application/json' },
+        clone() { return this; },
+        json: async () => emptySummary,
+      };
+    }
+    return origFetch(url, opts);
+  };
+  bodyEl.appendChild(opusRow.row);
+  eval(code);
+  await new Promise((r) => setImmediate(r));
+  flushRaf();
+  observerCb([{ target: bodyEl }]);
+  flushRaf();
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(emptyFetches, 1, 'Empty quota summary must honor TTL without spinning');
+  window.__jetskiClosedChatsFilterCleanup();
+
+  console.log('MODEL_QUOTA_SUMMARY_RESET_CLOCK_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Quota summary clock harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("MODEL_QUOTA_SUMMARY_RESET_CLOCK_PASSED", res.stdout)
+
   def test_patch_binary_and_idempotency(self) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
       bin_path = os.path.join(tmpdir, "jetski-hub-server")
