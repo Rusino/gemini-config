@@ -5495,6 +5495,10 @@ def fetch_gerrit_cl_status(
               else []
           ),
           "files": files,
+          # Extract SK_IGNORE_* tokens so [✓All Rolls] and Stage 1 can track staged changes
+          "staged_ifdef_macros": extract_staged_ifdef_macros(
+              commit_msg, (subject, *files)
+          ),
           "hashtags": hashtags,
           "topic": topic,
           "branch": branch,
@@ -14213,6 +14217,9 @@ def merge_concurrent_state_mutations(
           "self_triggered_dry_run_ps",
           "cq_status",
           "cq_failed",
+          "staged_ifdef_rolls_woken",
+          "staged_ifdef_rolls_pending_wake",
+          "staged_ifdef_macros",
       ):
         if field in ditem and ditem.get(field) != bitem.get(field):
           # Preserve explicit user mutations made during the poll
@@ -14241,6 +14248,34 @@ def merge_concurrent_state_mutations(
         dval = str(dw.get(wfield) or "")
         if dval and dval != str(bw.get(wfield) or "") and not sw.get(wfield):
           sw[wfield] = dval
+
+  # 6. Preserve concurrent staging_flags_audit snooze and scan watermarks
+  disk_audit = disk_state.get("staging_flags_audit")
+  if isinstance(disk_audit, dict):
+    base_audit = (
+        base.get("staging_flags_audit")
+        if isinstance(base.get("staging_flags_audit"), dict)
+        else {}
+    )
+    state_audit = state.get("staging_flags_audit")
+    # Adopt disk audit wholesale when the in-memory snapshot has not initialized it yet
+    if not isinstance(state_audit, dict):
+      state["staging_flags_audit"] = copy.deepcopy(disk_audit)
+    else:
+      # Copy fields mutated on disk during the poll (such as snoozed_week) without clobbering new scans
+      for afield in (
+          "snoozed_week",
+          "last_auto_week",
+          "scanned_at",
+          "actionable_count",
+          "flags",
+      ):
+        if (
+            afield in disk_audit
+            and disk_audit.get(afield) != base_audit.get(afield)
+            and state_audit.get(afield) == base_audit.get(afield)
+        ):
+          state_audit[afield] = copy.deepcopy(disk_audit[afield])
 
 
 def _parse_watched_cl_entry(raw: Any) -> dict[str, str] | None:
@@ -14655,6 +14690,434 @@ def poll_watched_cls(
           events=events,
           wake_chats=wake_chats,
       )
+
+
+# Exclude permanent API deprecation toggles from temporary staging #ifdef cleanup tracking
+LONG_LIVED_API_GUARDS: frozenset[str] = frozenset({
+    "SK_DISABLE_LEGACY_CLIENT_UNICODE",
+    "SK_DISABLE_LEGACY_SKSHAPER_FUNCTIONS",
+})
+
+_FLUTTER_SKIA_DIR = os.path.expanduser(
+    "~/.gemini/jetski/scratch/flutter/engine/src/flutter/skia"
+)
+_CHROMIUM_SKIA_DIR = os.path.expanduser("~/chromium/src/skia")
+_G3_SKIA_HEAD_DIR = os.path.join(
+    "/google", "src", "files", "head", "depot", "google3", "third_party", "skia", "HEAD"
+)
+
+DEFAULT_CLIENT_CONFIG_FILES: dict[str, tuple[str, ...]] = {
+    "Google3": (
+        os.path.join(_G3_SKIA_HEAD_DIR, "bazel", "SkUserConfig.h"),
+        os.path.join(_G3_SKIA_HEAD_DIR, "BUILD"),
+    ),
+    "Flutter": (
+        os.path.join(_FLUTTER_SKIA_DIR, "flutter_defines.gni"),
+        os.path.join(_FLUTTER_SKIA_DIR, "BUILD.gn"),
+        os.path.join(_FLUTTER_SKIA_DIR, "modules", "canvaskit", "BUILD.gn"),
+    ),
+    "Chrome": (
+        os.path.join(_CHROMIUM_SKIA_DIR, "config", "SkUserConfig.h"),
+        os.path.join(_CHROMIUM_SKIA_DIR, "BUILD.gn"),
+    ),
+}
+
+_STAGED_IFDEF_COMMIT_RE = re.compile(r"\b(SK_IGNORE_[A-Z0-9_]+)\b")
+_STAGING_MACRO_TOKEN_RE = re.compile(
+    r"\b(SK_IGNORE_[A-Z0-9_]+|SK_LEGACY_[A-Z0-9_]+|SK_DISABLE_LEGACY_[A-Z0-9_]+)\b"
+)
+_TEXT_FONT_MACRO_KEYWORDS: tuple[str, ...] = (
+    "PARAGRAPH",
+    "SHAPER",
+    "UNICODE",
+    "FONT",
+    "TEXT",
+    "ELLIPS",
+    "LINE",
+    "WORD",
+    "BREAK",
+    "GLYPH",
+    "STRUT",
+    "BIDI",
+)
+
+
+def extract_staged_ifdef_macros(
+    commit_msg: str, extra_texts: Any = ()
+) -> list[str]:
+  """Extracts sorted unique SK_IGNORE_* staging macros from a commit message and diff texts.
+
+  Inputs: commit_msg string and optional iterable of extra strings (diff lines, subjects, files).
+  Outputs: sorted deduplicated list of SK_IGNORE_* macro names excluding LONG_LIVED_API_GUARDS.
+  Side effects: None.
+  """
+  found: set[str] = set()
+  # Scan both commit message prose and extra diff/file strings for SK_IGNORE_* identifiers
+  for m in _STAGED_IFDEF_COMMIT_RE.findall(str(commit_msg or "")):
+    if m not in LONG_LIVED_API_GUARDS:
+      found.add(m)
+  for txt in extra_texts or ():
+    for m in _STAGED_IFDEF_COMMIT_RE.findall(str(txt or "")):
+      if m not in LONG_LIVED_API_GUARDS:
+        found.add(m)
+  return sorted(found)
+
+
+def current_iso_week() -> str:
+  """Returns the current ISO year and week watermark (YYYY-Www) in Eastern Time.
+
+  Inputs: None.
+  Outputs: ISO week string formatted as YYYY-Www.
+  Side effects: None.
+  """
+  iso = now_et().isocalendar()
+  return f"{int(iso[0]):04d}-W{int(iso[1]):02d}"
+
+
+# Strip C/C++ and GN/Bazel comments so commented-out #define lines do not trigger false positives
+def _strip_staging_scan_comments(raw: str, is_gn_or_bazel: bool) -> str:
+  no_block = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+  out_lines: list[str] = []
+  for line in no_block.splitlines():
+    cleaned = line.split("//", 1)[0]
+    # Only strip '#' in GN/Bazel files because '#define' is valid C preprocessor syntax
+    if is_gn_or_bazel:
+      cleaned = cleaned.split("#", 1)[0]
+    out_lines.append(cleaned)
+  return "\n".join(out_lines)
+
+
+# Scope Skia staging macro discovery to our text, shaper, unicode, and font port directories
+def _is_my_text_or_font_relpath(rel_path: str) -> bool:
+  norm = rel_path.replace("\\", "/").lstrip("/")
+  if norm.startswith(
+      ("modules/skparagraph/", "modules/skunicode/", "modules/skshaper/", "src/text/")
+  ):
+    return True
+  base = os.path.basename(norm)
+  if norm.startswith("src/ports/") and "font" in base.lower():
+    return True
+  if norm.startswith("src/core/") and base.startswith("SkFont"):
+    return True
+  return False
+
+
+def _is_text_or_font_macro_name(macro: str) -> bool:
+  return any(kw in macro for kw in _TEXT_FONT_MACRO_KEYWORDS)
+
+
+# Resolve the latest Skia commit touching `macro` so Stage 2 can verify downstream roll ancestry
+def _find_macro_intro_commit(skia_dir: str, macro: str) -> str:
+  if not skia_dir or not os.path.isdir(skia_dir) or not macro:
+    return ""
+  try:
+    res = subprocess.run(
+        [
+            "git",
+            "-C",
+            skia_dir,
+            "log",
+            "-n",
+            "1",
+            "--format=%H",
+            "-S",
+            macro,
+            "origin/main",
+            "--",
+            "modules/skparagraph",
+            "modules/skunicode",
+            "modules/skshaper",
+            "src/text",
+            "src/ports",
+            "src/core",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if res.returncode == 0:
+      return (res.stdout or "").strip().splitlines()[0] if (res.stdout or "").strip() else ""
+  except (OSError, subprocess.SubprocessError):
+    return ""
+  return ""
+
+
+# Walk Skia text/font directories directly on disk for <50ms zero-token macro discovery
+def _scan_skia_text_font_macros(skia_dir: str) -> dict[str, list[str]]:
+  skia_files_by_macro: dict[str, set[str]] = {}
+  if not skia_dir or not os.path.isdir(skia_dir):
+    return {}
+  scan_roots = (
+      "modules/skparagraph",
+      "modules/skunicode",
+      "modules/skshaper",
+      "src/text",
+      "src/ports",
+      "src/core",
+  )
+  for sub in scan_roots:
+    abs_root = os.path.join(skia_dir, sub)
+    if not os.path.isdir(abs_root):
+      continue
+    for dirpath, _dirnames, filenames in os.walk(abs_root):
+      for fname in filenames:
+        if not fname.endswith((".h", ".hpp", ".c", ".cc", ".cpp", ".mm")):
+          continue
+        abs_p = os.path.join(dirpath, fname)
+        rel_p = os.path.relpath(abs_p, skia_dir).replace("\\", "/")
+        if not _is_my_text_or_font_relpath(rel_p):
+          continue
+        try:
+          with open(abs_p, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+        except OSError:
+          continue
+        cleaned = _strip_staging_scan_comments(raw, is_gn_or_bazel=False)
+        for m in _STAGING_MACRO_TOKEN_RE.findall(cleaned):
+          if m in LONG_LIVED_API_GUARDS:
+            continue
+          if m.startswith("SK_IGNORE_") or _is_text_or_font_macro_name(m):
+            skia_files_by_macro.setdefault(m, set()).add(rel_p)
+  return {m: sorted(paths) for m, paths in skia_files_by_macro.items()}
+
+
+# Probe the 7 downstream client config files in Google3, Flutter, and Chromium for active defines
+def _scan_client_config_macros(
+    client_config_files: dict[str, tuple[str, ...]],
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+  clients_by_macro: dict[str, set[str]] = {}
+  locations_by_macro: dict[str, set[str]] = {}
+  for client_name, paths in client_config_files.items():
+    for p in paths or ():
+      if not p or not os.path.isfile(p):
+        continue
+      try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+          raw = f.read()
+      except OSError:
+        continue
+      is_gn_or_bazel = not p.endswith((".h", ".hpp", ".c", ".cc", ".cpp"))
+      cleaned = _strip_staging_scan_comments(raw, is_gn_or_bazel=is_gn_or_bazel)
+      for m in _STAGING_MACRO_TOKEN_RE.findall(cleaned):
+        if m in LONG_LIVED_API_GUARDS:
+          continue
+        clients_by_macro.setdefault(m, set()).add(client_name)
+        locations_by_macro.setdefault(m, set()).add(
+            f"{client_name}:{os.path.basename(p)}"
+        )
+  return clients_by_macro, locations_by_macro
+
+
+def scan_staging_flags(
+    *,
+    skia_dir: str = DEFAULT_SKIA_DIR,
+    items: dict[str, Any] | None = None,
+    rollers: dict[str, Any] | None = None,
+    client_config_files: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, Any]:
+  """Scans Skia text/font sources, open Gerrit CLs, and 7 client configs for staging macros.
+
+  Inputs: skia_dir path, watcher items dict, Gardener rollers dict, and optional client_config_files.
+  Outputs: audit dict containing scanned_at, actionable_count, and classified flags across Stages 1-5.
+  Side effects: reads local Skia/client files and invokes git log/merge-base when needed.
+  """
+  eff_items = items if isinstance(items, dict) else {}
+  eff_rollers = rollers if isinstance(rollers, dict) else {}
+  eff_clients = (
+      client_config_files
+      if isinstance(client_config_files, dict)
+      else DEFAULT_CLIENT_CONFIG_FILES
+  )
+
+  # Collect macros referenced by open Gerrit CLs to guard pre-landed client defines (Stage 1)
+  open_cls_by_macro: dict[str, set[str]] = {}
+  for rec in eff_items.values():
+    if not isinstance(rec, dict):
+      continue
+    if str(rec.get("status") or "").upper() not in ("NEW", "OPEN"):
+      continue
+    rec_macros = rec.get("staged_ifdef_macros")
+    if not isinstance(rec_macros, list):
+      rec_macros = extract_staged_ifdef_macros(
+          str(rec.get("commit_message") or ""), rec.get("files") or []
+      )
+    cl_label = str(
+        rec.get("target_id") or rec.get("item_key") or rec.get("url") or "open-cl"
+    )
+    for m in rec_macros:
+      if m and m not in LONG_LIVED_API_GUARDS:
+        open_cls_by_macro.setdefault(str(m), set()).add(cl_label)
+
+  skia_files_by_macro = _scan_skia_text_font_macros(skia_dir)
+  clients_by_macro, locations_by_macro = _scan_client_config_macros(eff_clients)
+
+  # Restrict client-only orphan candidates to text/font macro names so GPU/core defines are ignored
+  candidate_macros: set[str] = (
+      set(skia_files_by_macro)
+      | set(open_cls_by_macro)
+      | {m for m in clients_by_macro if _is_text_or_font_macro_name(m)}
+  ) - LONG_LIVED_API_GUARDS
+
+  flags: list[dict[str, Any]] = []
+  for macro in sorted(candidate_macros):
+    skia_files = skia_files_by_macro.get(macro, [])
+    in_skia = bool(skia_files)
+    open_cls = sorted(open_cls_by_macro.get(macro, set()))
+    clients_defining = sorted(clients_by_macro.get(macro, set()))
+    client_locs = sorted(locations_by_macro.get(macro, set()))
+    unrolled_clients: list[str] = []
+    intro_sha = ""
+
+    # Stage 1: macro is actively being staged in an open Skia CL -> never flag as orphan
+    if open_cls:
+      stage = "STAGE_1_IN_REVIEW"
+      actionable = False
+    elif in_skia and clients_defining:
+      # Stage 2 vs Stage 3: verify the introducing Skia commit has rolled into each defining client
+      intro_sha = _find_macro_intro_commit(skia_dir, macro)
+      if intro_sha:
+        for cname in clients_defining:
+          r_info = eff_rollers.get(cname)
+          roll_rev = (
+              str(r_info.get("last_roll_rev") or "").strip()
+              if isinstance(r_info, dict)
+              else ""
+          )
+          if roll_rev and not _git_is_ancestor(skia_dir, intro_sha, roll_rev):
+            unrolled_clients.append(cname)
+      if unrolled_clients:
+        stage = "STAGE_2_ROLLING"
+        actionable = False
+      else:
+        stage = "STAGE_3_CLIENT_FLIP"
+        actionable = True
+    elif in_skia and not clients_defining:
+      # Stage 4: no client defines the macro anymore -> ready to remove #ifdef in Skia
+      stage = "STAGE_4_SKIA_CLEANUP"
+      actionable = True
+    else:
+      # Stage 5: client config still defines a text/font macro already removed from Skia main
+      stage = "STAGE_5_ORPHAN_CLIENT_DEFINE"
+      actionable = True
+
+    flags.append({
+        "macro": macro,
+        "stage": stage,
+        "actionable": actionable,
+        "skia_files": skia_files,
+        "clients_defining": clients_defining,
+        "client_locations": client_locs,
+        "open_cls": open_cls,
+        "unrolled_clients": unrolled_clients,
+        "intro_commit": intro_sha,
+    })
+
+  actionable_count = sum(1 for f in flags if f.get("actionable"))
+  return {
+      "scanned_at": now_et_str(),
+      "last_auto_week": "",
+      "snoozed_week": "",
+      "actionable_count": actionable_count,
+      "flags": flags,
+  }
+
+
+def maybe_run_weekly_staging_flags_audit(
+    state: dict[str, Any],
+    items: dict[str, Any] | None = None,
+    rollers: dict[str, Any] | None = None,
+    *,
+    skia_dir: str = DEFAULT_SKIA_DIR,
+    client_config_files: dict[str, tuple[str, ...]] | None = None,
+    force: bool = False,
+) -> bool:
+  """Runs scan_staging_flags at most once per ISO week unless force=True.
+
+  Inputs: mutable state dict, optional items/rollers dicts, skia_dir, client_config_files, force.
+  Outputs: True when a scan executed and updated state["staging_flags_audit"], False when skipped.
+  Side effects: mutates state["staging_flags_audit"].
+  """
+  cur_week = current_iso_week()
+  prev = (
+      state.get("staging_flags_audit")
+      if isinstance(state.get("staging_flags_audit"), dict)
+      else {}
+  )
+  # Skip automatic background scans once the current ISO week watermark is recorded
+  if not force and str(prev.get("last_auto_week") or "") == cur_week:
+    return False
+  eff_items = (
+      items
+      if isinstance(items, dict)
+      else (state.get("items") if isinstance(state.get("items"), dict) else {})
+  )
+  eff_rollers = (
+      rollers
+      if isinstance(rollers, dict)
+      else (
+          state.get("rollers_summary")
+          if isinstance(state.get("rollers_summary"), dict)
+          else {}
+      )
+  )
+  report = scan_staging_flags(
+      skia_dir=skia_dir,
+      items=eff_items,
+      rollers=eff_rollers,
+      client_config_files=client_config_files,
+  )
+  report["last_auto_week"] = cur_week
+  # Clear weekly snooze when the user explicitly clicks the on-demand scan button
+  report["snoozed_week"] = "" if force else str(prev.get("snoozed_week") or "")
+  state["staging_flags_audit"] = report
+  return True
+
+
+def snooze_staging_flags_audit() -> dict[str, Any]:
+  """Snoozes the Flight Deck staging flags card for the current ISO week.
+
+  Inputs: None.
+  Outputs: dict with ok=True, snoozed_week, and updated audit dict.
+  Side effects: loads and saves STATE_FILE.
+  """
+  state = load_watcher_state()
+  audit = state.get("staging_flags_audit")
+  if not isinstance(audit, dict):
+    audit = {}
+    state["staging_flags_audit"] = audit
+  cur_week = current_iso_week()
+  audit["snoozed_week"] = cur_week
+  save_watcher_state(state)
+  return {"ok": True, "snoozed_week": cur_week, "audit": audit}
+
+
+def trigger_staging_flags_scan(
+    *,
+    skia_dir: str = DEFAULT_SKIA_DIR,
+    client_config_files: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, Any]:
+  """Runs an immediate on-demand staging flags scan and clears any active snooze watermark.
+
+  Inputs: optional skia_dir and client_config_files overrides.
+  Outputs: dict with ok=True and the refreshed staging_flags_audit report.
+  Side effects: loads and saves STATE_FILE.
+  """
+  state = load_watcher_state()
+  maybe_run_weekly_staging_flags_audit(
+      state,
+      items=state.get("items") if isinstance(state.get("items"), dict) else {},
+      rollers=(
+          state.get("rollers_summary")
+          if isinstance(state.get("rollers_summary"), dict)
+          else {}
+      ),
+      skia_dir=skia_dir,
+      client_config_files=client_config_files,
+      force=True,
+  )
+  save_watcher_state(state)
+  return {"ok": True, "audit": state["staging_flags_audit"]}
 
 
 def sync_once(
@@ -15229,6 +15692,20 @@ def _sync_once_locked(
     elif not prev:
       record["audited_msg_date"] = str(info.get("last_msg_date") or "")
 
+    # Carry forward staged #ifdef [✓All Rolls] wakeup watermarks across polls and --no-wake runs
+    record["staged_ifdef_macros"] = list(
+        info.get("staged_ifdef_macros")
+        or extract_staged_ifdef_macros(
+            str(info.get("commit_message") or ""), info.get("files") or []
+        )
+    )
+    if prev.get("staged_ifdef_rolls_woken"):
+      record["staged_ifdef_rolls_woken"] = True
+    if prev.get("staged_ifdef_rolls_pending_wake") and not record.get(
+        "staged_ifdef_rolls_woken"
+    ):
+      record["staged_ifdef_rolls_pending_wake"] = True
+
     # Carry forward self_triggered_dry_run_ps across equivalent patchsets and handle armed CR+1
     cur_ps_num = int(info.get("patchset") or 0)
     cur_rev_sha = str(info.get("revision") or "")
@@ -15481,6 +15958,12 @@ def _sync_once_locked(
           gstat["inbox_messages"] = []
         # Title badge already shows [✓All Rolls] and Flight Deck offers Finalize directly
         already_woken = True
+        if (
+            record.get("is_self")
+            and record.get("staged_ifdef_macros")
+            and not record.get("staged_ifdef_rolls_woken")
+        ):
+          record["staged_ifdef_rolls_pending_wake"] = True
         transition_msg = (
             f"[CL-WATCHER] 🏁 Все 4 авторолла (Android, Chrome, Google3, Flutter) и "
             f"Skia Status успешно прошли для {ikey} ({info['revision'][:10]})! "
@@ -15556,6 +16039,30 @@ def _sync_once_locked(
         if cid and wake_chats and not already_woken:
           # Pass item_key so quota-held transition wakeups retain their CL association
           wake_conversation(cid, transition_msg, item_key=ikey)
+
+    # Deliver one-shot Stage 3 wakeup when a self Skia CL with SK_IGNORE_* reaches [✓All Rolls]
+    if (
+        cid
+        and wake_chats
+        and record.get("staged_ifdef_rolls_pending_wake")
+        and not record.get("staged_ifdef_rolls_woken")
+        and record.get("staged_ifdef_macros")
+    ):
+      chain = cl.discover_conversation_chain(cid, include_descendants=True)
+      leaf_cid = chain[-1] if chain else cid
+      macros_str = ", ".join(record["staged_ifdef_macros"])
+      stage3_msg = (
+          f"[CL-WATCHER] 🏁 Stage 3 ifdef cleanup ready for "
+          f"[Skia CL {tid}]({info.get('url', '')}): все 4 авторолла прошли "
+          f"([✓All Rolls]) для изменения со staging-макросом `{macros_str}`. "
+          f"Подготовь клиентские изменения Stage 3 (снятие временного `#define` "
+          f"для `{macros_str}` и обновление тестов/golden-снимков у клиентов) "
+          f"и спроси подтверждение через ask_question."
+      )
+      woken = wake_conversation(leaf_cid, stage3_msg, item_key=ikey)
+      if woken or f"conv:{leaf_cid}" in quota_hold.load_hold_queue():
+        record["staged_ifdef_rolls_woken"] = True
+        record["staged_ifdef_rolls_pending_wake"] = False
 
     # Route assigned reviewer CLs/PRs through deterministic Tier 0/1/2 pre-gate
     is_reviewer_candidate = (
@@ -16002,6 +16509,10 @@ def _sync_once_locked(
       wake_chats=wake_chats,
       skia_dir=skia_dir,
   )
+  if skia_dir and os.path.isdir(skia_dir):
+    maybe_run_weekly_staging_flags_audit(
+        state, new_items, rollers, skia_dir=skia_dir
+    )
 
   state["items"] = new_items
   state["review_claims"] = review_claims
@@ -16967,6 +17478,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="view-switch" id="view-switch" role="tablist" aria-label="View"></div>
     <nav class="rollers" id="rollers" aria-label="Skia autorollers"></nav>
     <div class="synced" id="synced">Loading…</div>
+    <button class="link-btn" id="staging-flags-btn" onclick="triggerStagingFlagsScan(this)" title="Scan Skia and client configs for staged #ifdef macros">🔍 Staging flags</button>
     <button class="link-btn" id="refresh-btn" onclick="triggerRefresh()">Refresh</button>
   </div>
 </header>
@@ -21205,6 +21717,7 @@ function persistCachedStatus(data) {
         items: data.items || {},
         bugs: data.bugs || {},
         merge_request_groups: data.merge_request_groups || {},
+        staging_flags_audit: data.staging_flags_audit || null,
         bug_sync_errors: data.bug_sync_errors || [],
         rollers_summary: data.rollers_summary || {},
         gardener_url: data.gardener_url || '',
@@ -21852,7 +22365,7 @@ function render(forceMorph = false) {
 
   patchSlotHtml(
     document.getElementById('focus'),
-    renderFocusSection(needYouItems, shown, data),
+    renderFocusSection(needYouItems, shown, data) + renderStagingFlagsCard(data),
     forceMorph,
   );
   patchSlotHtml(
@@ -22380,6 +22893,83 @@ async function assignReviewer(itemKeys, reviewerEmail, btn) {
   }
 }
 
+// Renders weekly/on-demand staged #ifdef cleanup card in Needs You when actionable flags exist
+function renderStagingFlagsCard(data) {
+  const audit = data && data.staging_flags_audit;
+  if (!audit || typeof audit !== 'object') return '';
+  const curWeek = String(audit.last_auto_week || '');
+  // Hide the card for the rest of the current ISO week once snoozed by the user
+  if (curWeek && String(audit.snoozed_week || '') === curWeek) return '';
+  if (selectedProject !== 'ALL' && selectedProject !== 'SkParagraph' && selectedProject !== 'Skia') {
+    return '';
+  }
+  const flags = Array.isArray(audit.flags) ? audit.flags.filter(f => f && f.actionable) : [];
+  if (!flags.length) return '';
+  const rows = flags.map(f => {
+    const clients = Array.isArray(f.clients_defining) && f.clients_defining.length
+      ? f.clients_defining.join(', ')
+      : '0 clients';
+    const stageBadge = f.stage === 'STAGE_3_CLIENT_FLIP'
+      ? 'Stage 3: Client flip'
+      : (f.stage === 'STAGE_4_SKIA_CLEANUP' ? 'Stage 4: Skia #ifdef removal' : 'Stage 5: Orphan client define');
+    return `<div><code>${esc(f.macro || '')}</code> · <b>${esc(stageBadge)}</b> (${esc(clients)})</div>`;
+  }).join('');
+  return `<article class="card" data-unit-key="staging-flags-card">` +
+    `<div><div class="eyebrow">SkParagraph / Skia · Weekly Staging Flags Audit (${esc(curWeek || 'on-demand')})</div>` +
+    `<h2>🧹 ${flags.length} staged #ifdef macro${flags.length === 1 ? '' : 's'} ready for cleanup</h2>` +
+    `<div class="why">${rows}</div></div>` +
+    `<div class="actions">` +
+    `<button class="btn secondary" onclick="triggerStagingFlagsScan(this)">🔄 Re-scan</button>` +
+    `<button class="btn secondary" onclick="snoozeStagingFlags(this)">💤 Snooze 1w</button>` +
+    `</div></article>`;
+}
+
+// Triggers an immediate on-demand staging flags scan across Skia and the 7 client config files
+async function triggerStagingFlagsScan(btn) {
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Scanning…';
+  }
+  try {
+    const resp = await fetch('/api/staging_flags/scan', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+    });
+    const res = await resp.json().catch(() => null);
+    if (res && res.ok) await fetchState(true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
+  }
+}
+
+// Snoozes the staging flags audit card for the remainder of the current ISO week
+async function snoozeStagingFlags(btn) {
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Snoozing…';
+  }
+  try {
+    const resp = await fetch('/api/staging_flags/snooze', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+    });
+    const res = await resp.json().catch(() => null);
+    if (res && res.ok) await fetchState(true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
+  }
+}
+
 async function triggerRefresh() {
   const btn = document.getElementById('refresh-btn');
   btn.textContent = 'Refreshing…';
@@ -22586,6 +23176,8 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         "/api/disarm_approve_review",
         "/api/reassign_merge",
         "/api/save_gerrit_draft",
+        "/api/staging_flags/scan",
+        "/api/staging_flags/snooze",
     ):
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = (
@@ -22748,6 +23340,10 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
           res = {"ok": False, "error": str(exc)}
       elif parsed.path == "/api/diagnose_checks":
         res = diagnose_checks_item(str(bdict.get("item_key") or ""))
+      elif parsed.path == "/api/staging_flags/scan":
+        res = trigger_staging_flags_scan()
+      elif parsed.path == "/api/staging_flags/snooze":
+        res = snooze_staging_flags_audit()
       else:
         res = rebase_item(str(bdict.get("item_key") or ""))
       self._send_json(res, code=200 if res.get("ok") else 400)
