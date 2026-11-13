@@ -1,0 +1,24 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "CRON_TZ=America/New_York 30 19 * * *",
+    "env",
+    "-u",
+    "ANTIGRAVITY_SOURCE_METADATA",
+    "agentapi",
+    "new-conversation",
+    "--title=Digest: Daily Calendar",
+    "--",
+    "Ежедневная вечерняя сводка по трём календарям (`jlavrova@google.com`, `jlavrova@gmail.com` и `Prosper PTS Appointments`).\n\n1. Сразу установи английский заголовок чата с сегодняшней датой через `python3 /usr/local/google/home/jlavrova/.gemini/config/hooks/chat_lifecycle.py set-title <CONVERSATION_ID> \"Digest: Daily Calendar (<YYYY-MM-DD>)\"`.\n2. Запусти отправку сводки ровно одной командой (ничего не меняя в самих календарях): `python3 /usr/local/google/home/jlavrova/.gemini/config/scripts/daily_calendar_digest.py --send`.\n3. Коротко (в 2–4 строках на русском, неформально на «ты», женский род от лица агента) подтверди отправку писем на `jlavrova@google.com` и `jlavrova@gmail.com` и перечисли только пункты `🔴`/`⚠️` из блока внимания (либо одной строкой напиши, что накладок и незакрытых визитов на ближайшие 4 дня нет), без вопросов в конце."
+  ],
+  "restart_policy": "always",
+  "display_name": "Daily 3-Calendar Digest (7:30 PM ET)",
+  "description": "Every day at 7:30 PM America/New_York, reads Work (jlavrova@google.com), Personal (jlavrova@gmail.com), and Prosper PT calendars for tomorrow + 3 days ahead, checks overlaps and missing or unbuffered Physical therapy OOO blocks (>=15m pre / >=15m post travel buffer, -20m/+15m recommended), and emails a full HTML digest to jlavrova@google.com and a work-title-masked HTML digest to jlavrova@gmail.com.",
+  "agent_permissions": {
+    "access_grants": [
+      "command(python3 /usr/local/google/home/jlavrova/.gemini/config/scripts/daily_calendar_digest.py)",
+      "command(python3 /usr/local/google/home/jlavrova/.gemini/config/hooks/chat_lifecycle.py)",
+      "read_file(/usr/local/google/home/jlavrova/.gemini/config/scripts/daily_calendar_digest.py)"
+    ]
+  }
+}
