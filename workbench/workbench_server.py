@@ -22,9 +22,12 @@ from typing import Any
 import urllib.parse
 
 WORKBENCH_DIR = os.path.dirname(os.path.abspath(__file__))
-if WORKBENCH_DIR not in sys.path:
-  sys.path.insert(0, WORKBENCH_DIR)
+SCRIPTS_DIR = os.path.join(os.path.dirname(WORKBENCH_DIR), "scripts")
+for _p in (WORKBENCH_DIR, SCRIPTS_DIR):
+  if _p not in sys.path:
+    sys.path.insert(0, _p)
 
+import entity_state  # pylint: disable=g-import-not-at-top
 import ingestor  # pylint: disable=g-import-not-at-top
 import work_store  # pylint: disable=g-import-not-at-top
 import workctl  # pylint: disable=g-import-not-at-top
@@ -375,6 +378,62 @@ def _slim_rolls(raw_rolls: Any) -> dict[str, bool]:
   return out
 
 
+def _format_gate_summary(cgs: Mapping[str, Any]) -> dict[str, str] | None:
+  """Formats combined_gate_state into a compact {status, label} corpus badge."""
+  if not cgs.get("anyRequired"):
+    return None
+  g_st = str(cgs.get("status") or "").strip().lower()
+  if g_st not in ("passed", "pending", "failed", "waived"):
+    return None
+  active_lbl = str(cgs.get("activeLabel") or "").strip()
+  passed_lbl = str(cgs.get("passedLabel") or "").strip()
+  if g_st == "passed":
+    lbl = passed_lbl or active_lbl
+    return {"status": "passed", "label": f"{lbl} OK"} if lbl else None
+  # Keep already-passed half visible while the sibling gate is still running or pending
+  if g_st == "pending":
+    if passed_lbl and active_lbl:
+      return {"status": "pending", "label": f"{passed_lbl} OK · {active_lbl} pending"}
+    lbl = active_lbl or passed_lbl
+    return {"status": "pending", "label": f"{lbl} pending"} if lbl else None
+  lbl = active_lbl or passed_lbl
+  return {"status": g_st, "label": f"{lbl} {g_st}"} if lbl else None
+
+
+def _extract_corpus_gate(
+    ast: Mapping[str, Any] | None,
+    *,
+    cl_status: str = "",
+    art_kind: str = "",
+) -> dict[str, str] | None:
+  """Extracts open-CL corpus gate status/label from slimmed state, triage, or entity_state."""
+  if not isinstance(ast, Mapping):
+    return None
+  # Merged/abandoned CLs switch to post-submit roll dots; Gerrit merge PS bumps look stale otherwise
+  st_u = str(cl_status or ast.get("status") or "OPEN").strip().upper()
+  if st_u not in ("NEW", "OPEN"):
+    return None
+  cg = ast.get("corpus_gate")
+  if isinstance(cg, Mapping):
+    cg_st = str(cg.get("status") or "").strip().lower()
+    cg_lbl = str(cg.get("label") or "").strip()
+    if cg_st in ("passed", "pending", "failed", "waived") and cg_lbl:
+      return {"status": cg_st, "label": cg_lbl}
+    return None
+  if isinstance(ast.get("triage"), Mapping):
+    eval_item = dict(ast)
+    # Map Workbench github_pr artifacts onto entity_state's github kind for SHA-based gate checks
+    if eval_item.get("kind") == "github_pr" or (
+        not eval_item.get("kind") and art_kind == "github_pr"
+    ):
+      eval_item["kind"] = "github"
+    return _format_gate_summary(entity_state.combined_gate_state(eval_item))
+  est = ast.get("entity_state")
+  if isinstance(est, Mapping) and isinstance(est.get("combined_gate_state"), Mapping):
+    return _format_gate_summary(est["combined_gate_state"])
+  return None
+
+
 def _slim_artifact(art: Mapping[str, Any]) -> dict[str, Any]:
   """Projects one artifact to UI-visible fields while preserving bug and draft cross-links."""
   out: dict[str, Any] = {
@@ -441,6 +500,12 @@ def _slim_artifact(art: Mapping[str, Any]) -> dict[str, Any]:
     slim_est = {k: est[k] for k in ("status", "lane") if est.get(k)}
     if slim_est:
       slim_st["entity_state"] = slim_est
+
+  # Precompute compact corpus_gate pill before dropping raw triage/entity_state dicts
+  if out["kind"] in ("gerrit", "github_pr", "piper"):
+    cg = _extract_corpus_gate(ast, art_kind=out["kind"])
+    if cg:
+      slim_st["corpus_gate"] = cg
 
   # Extract mentioned CL keys/digits from Gmail draft body/snippet before dropping raw draft text
   if out["kind"] == "gmail_draft":
@@ -520,6 +585,10 @@ def _build_card_search_text(card: Mapping[str, Any]) -> str:
     if isinstance(ast, Mapping):
       for sk in ("subject", "counterparty", "wip_label", "status", "cascade_id"):
         _add(ast.get(sk))
+      cg = ast.get("corpus_gate")
+      if isinstance(cg, Mapping):
+        _add(cg.get("label"))
+        _add(cg.get("status"))
       for bk in ast.get("linked_bug_keys") or ():
         _add(bk)
         _add(_short_issue_id({"artifact_key": bk}))
@@ -589,15 +658,19 @@ def _build_ssr_checklist_peers(
       # Omit redundant fix badge when the CL already sits inside that exact bug peer
       if short_bug and why_b == f"фикс {short_bug}":
         why_b = ""
+      c_st = str(c.get("status") or ast.get("status") or "")
       cls_out.append({
           "artifact_key": ckey,
           "short_label": short_lbl,
           "ps_tag": ps_tag,
           "url": str(c.get("url") or art.get("url") or "#"),
           "subject": _clean_cl_subject(str(c.get("subject") or ""), ast, short_lbl),
-          "status": str(c.get("status") or ast.get("status") or ""),
+          "status": c_st,
           "merge_conflict": bool(c.get("merge_conflict")),
           "is_wip": bool(c.get("is_wip") or ast.get("is_draft")),
+          "corpus_gate": _extract_corpus_gate(
+              ast, cl_status=c_st, art_kind=str(art.get("kind") or "")
+          ),
           "why_badge": why_b,
       })
     peers.append({
@@ -774,6 +847,9 @@ def _attach_ssr_uncovered_cls(
         "merge_conflict": bool(ast.get("merge_conflict")),
         "is_wip": is_wip,
         "desk_kind": desk_kind,
+        "corpus_gate": _extract_corpus_gate(
+            ast, cl_status=st_str, art_kind=str(a.get("kind") or "")
+        ),
         "why_badge": why_b,
     }
     lbugs = _extract_ssr_cl_bug_keys(ast)
@@ -880,6 +956,13 @@ def _render_ssr_peer_row(wid: str, peer: dict[str, Any]) -> str:
         and not (is_standalone_single and c["subject"] == peer["title"])
     )
     subj_ssr = f' <span class="wb-cl-subj">{_esc(c["subject"])}</span>' if show_subj else ""
+    cg = c.get("corpus_gate")
+    corpus_ssr = (
+        f' <span class="wb-cl-tag wb-corpus-tag" data-unit-key="cl-corpus" '
+        f'data-gate-status="{_esc(cg["status"])}">{_esc(cg["label"])}</span>'
+        if isinstance(cg, Mapping) and cg.get("label")
+        else ""
+    )
     why_ssr = (
         f' <span class="wb-why">· {_esc(c["why_badge"])}</span>'
         if c["why_badge"]
@@ -889,7 +972,7 @@ def _render_ssr_peer_row(wid: str, peer: dict[str, Any]) -> str:
         f'<div class="wb-cl-chip re-cl-row">'
         f'<a class="re-cl-link" href="{_esc(c["url"])}" '
         f'target="_blank" rel="noopener">{_esc(c["short_label"])}</a>'
-        f"{ps_ssr}{subj_ssr}{why_ssr}</div>"
+        f"{ps_ssr}{subj_ssr}{corpus_ssr}{why_ssr}</div>"
     )
   extra_ssr = "".join(
       f'<a class="re-extra-bug" href="{_esc(ex["url"])}" '
@@ -2179,6 +2262,29 @@ def render_workbench_html(
     border-radius: 4px;
     font-weight: 600;
     white-space: nowrap;
+  }}
+  .wb-corpus-tag {{
+    border: 1px solid transparent;
+  }}
+  .wb-corpus-tag[data-gate-status="passed"] {{
+    background: #f0fdf4;
+    color: var(--ready);
+    border-color: rgba(21, 128, 61, 0.2);
+  }}
+  .wb-corpus-tag[data-gate-status="pending"] {{
+    background: #fffbeb;
+    color: var(--warn);
+    border-color: rgba(180, 83, 9, 0.22);
+  }}
+  .wb-corpus-tag[data-gate-status="failed"] {{
+    background: #fff2f1;
+    color: var(--urgent);
+    border-color: rgba(255, 59, 48, 0.24);
+  }}
+  .wb-corpus-tag[data-gate-status="waived"] {{
+    background: #f1f5f9;
+    color: var(--muted);
+    border-color: rgba(134, 134, 139, 0.22);
   }}
   .re-empty-spine {{
     font-size: 10.5px;
@@ -3492,6 +3598,40 @@ def render_workbench_html(
     return {{ keys, digits }};
   }}
 
+  // Extract open-CL corpus gate pill from slimmed /api/state or unslimmed entity_state fixtures
+  function extractCorpusGate(ast, clStatus) {{
+    const stObj = (ast && typeof ast === 'object') ? ast : null;
+    if (!stObj || !isOpenClStatus(clStatus || stObj.status || 'OPEN')) return null;
+    if (stObj.corpus_gate && typeof stObj.corpus_gate === 'object') {{
+      const cgSt = String(stObj.corpus_gate.status || '').trim().toLowerCase();
+      const cgLbl = String(stObj.corpus_gate.label || '').trim();
+      return (['passed', 'pending', 'failed', 'waived'].includes(cgSt) && cgLbl)
+        ? {{ status: cgSt, label: cgLbl }}
+        : null;
+    }}
+    const est = (stObj.entity_state && typeof stObj.entity_state === 'object')
+      ? stObj.entity_state : null;
+    const cgs = (est && est.combined_gate_state && typeof est.combined_gate_state === 'object')
+      ? est.combined_gate_state : null;
+    if (!cgs || !cgs.anyRequired) return null;
+    const gSt = String(cgs.status || '').trim().toLowerCase();
+    if (!['passed', 'pending', 'failed', 'waived'].includes(gSt)) return null;
+    const activeLbl = String(cgs.activeLabel || '').trim();
+    const passedLbl = String(cgs.passedLabel || '').trim();
+    if (gSt === 'passed') {{
+      const lbl = passedLbl || activeLbl;
+      return lbl ? {{ status: 'passed', label: `${{lbl}} OK` }} : null;
+    }}
+    if (gSt === 'pending') {{
+      const lbl = (passedLbl && activeLbl)
+        ? `${{passedLbl}} OK · ${{activeLbl}} pending`
+        : (activeLbl || passedLbl ? `${{activeLbl || passedLbl}} pending` : '');
+      return lbl ? {{ status: 'pending', label: lbl }} : null;
+    }}
+    const lbl = activeLbl || passedLbl;
+    return lbl ? {{ status: gSt, label: `${{lbl}} ${{gSt}}` }} : null;
+  }}
+
   // Convert checklist items into baseline peer entries and record covered artifact keys
   function buildChecklistPeers(chkList, artByKey, covered) {{
     const peers = [];
@@ -3514,13 +3654,14 @@ def render_workbench_html(
         const mergedRolls = (c.rolls && Object.keys(c.rolls).length)
           ? c.rolls
           : ((ast.post_submit && ast.post_submit.rolls) || ast.rolls || {{}});
+        const cStatus = String(c.status || ast.status || '');
         return {{
           artifact_key: ckey,
           shortLabel,
           psTag: finalPs,
           url: c.url || art.url || '#',
           subject: cleanClSubject(c.subject || '', ast, shortLabel),
-          status: String(c.status || ast.status || ''),
+          status: cStatus,
           is_wip: Boolean(c.is_wip || ast.is_draft),
           wip_label: String(c.wip_label || (ast.is_draft ? 'Draft' : '')),
           merge_conflict: Boolean(c.merge_conflict),
@@ -3529,6 +3670,7 @@ def render_workbench_html(
           is_stacked: Boolean(c.is_stacked),
           updated_et: String(c.updated_et || ''),
           rolls: mergedRolls,
+          corpus_gate: extractCorpusGate(ast, cStatus),
           why_badge: whyBadge,
         }};
       }});
@@ -3727,6 +3869,7 @@ def render_workbench_html(
         is_stacked: Boolean(ast.is_stacked),
         updated_et: String(ast.updated_et || ast.status_changed_et || ast.last_msg_et || ''),
         rolls: mergedRolls,
+        corpus_gate: extractCorpusGate(ast, stStr),
         why_badge: whyBadge,
       }};
       const lbugs = extractClBugKeysJs(ast);
@@ -3821,6 +3964,7 @@ def render_workbench_html(
     if (peer.draftOutdated) return true;
     for (const c of peer.cls) {{
       if (c.merge_conflict || c.is_wip || c.desk_kind) return true;
+      if (c.corpus_gate && c.corpus_gate.status === 'failed') return true;
       if (isOpenClStatus(c.status) && Number(c.assigned_reviewers_count ?? 1) === 0) return true;
       if (hasDraft && c.in_draft === false) return true;
     }}
@@ -4248,6 +4392,11 @@ def render_workbench_html(
     const confBadge = c.merge_conflict
       ? '<span class="wb-cl-tag" style="background:#fff2f1;color:var(--urgent)">conflict</span>'
       : '';
+    const corpusBadge = (c.corpus_gate && c.corpus_gate.label)
+      ? `<span class="wb-cl-tag wb-corpus-tag" data-unit-key="cl-corpus" `
+        + `data-gate-status="${{esc(c.corpus_gate.status)}}">`
+        + `${{esc(c.corpus_gate.label)}}</span>`
+      : '';
     const draftMissBadge = (hasDraft && c.in_draft === false)
       ? '<span class="wb-cl-tag" style="background:#fffbeb;color:var(--warn)">not in draft</span>'
       : '';
@@ -4272,7 +4421,7 @@ def render_workbench_html(
            target="_blank" rel="noopener">${{esc(c.shortLabel)}}</a>
         ${{psBadge}}
         ${{subjSpan}}
-        ${{confBadge}}${{wipBadge}}${{noRevBadge}}${{draftMissBadge}}${{stackBadge}}
+        ${{confBadge}}${{wipBadge}}${{noRevBadge}}${{corpusBadge}}${{draftMissBadge}}${{stackBadge}}
         ${{renderRollDots({{ state: {{ rolls: c.rolls }} }})}}
         ${{whySpan}}
         ${{updSpan}}

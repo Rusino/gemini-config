@@ -522,6 +522,47 @@ class AuditGateTests(unittest.TestCase):
         self.assertEqual(delta["delta_kind"], "unchanged")
         self.assertFalse(delta["is_code_change"])
 
+    # Verify Tier 1 and Tier 2 SkParagraph audit prompts invoke run_flutter_paragraph_tests.py
+    # with --full so broken Canary-Flutter rolls cannot leave non-targeted Flutter suites uncovered
+    def test_flutter_corpus_gate_passes_full_flag_across_tiers(self):
+        item = {
+            "item_key": "gerrit:1427776",
+            "kind": "gerrit",
+            "target_id": "1427776",
+            "url": "https://skia-review.googlesource.com/c/skia/+/1427776",
+            "subject": "[skparagraph] Compare edging, subpixel and hinting in TextStyle::equals",
+            "patchset": 1,
+            "revision": "6d20ea001319",
+            "is_external": True,
+            "role": "reviewer (ext)",
+            "files": ["modules/skparagraph/src/TextStyle.cpp"],
+        }
+        t2_prompt = audit_gate.build_audit_prompt(
+            tier=2,
+            item=item,
+            prev_triage=None,
+            delta_info={"delta_kind": "initial"},
+            has_citc=True,
+        )
+        self.assertIn(
+            "run_flutter_paragraph_tests.py --full --out /tmp/flutter_cl_1427776_ps1",
+            t2_prompt,
+        )
+        t1_prompt = audit_gate.build_audit_prompt(
+            tier=1,
+            item={**item, "patchset": 2},
+            prev_triage={"triaged_patchset": 1, "triaged_revision": "6d20ea001319"},
+            delta_info={
+                "delta_kind": "rebase_only",
+                "upstream_commits": ["ce0b85b46d Soft hyphen in justify"],
+            },
+            has_citc=False,
+        )
+        self.assertIn(
+            "run_flutter_paragraph_tests.py --full --out /tmp/flutter_cl_1427776_ps2",
+            t1_prompt,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

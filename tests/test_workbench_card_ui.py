@@ -1411,6 +1411,366 @@ assert.strictEqual(standaloneChats.length, 2, 'Generic raw chats must not merge'
     proc = subprocess.run(["node", "-e", node_code], capture_output=True, text=True, check=False)
     self.assertEqual(proc.returncode, 0, msg=f"Node failed:\n{proc.stderr}\n{proc.stdout}")
 
+  def test_corpus_gate_pills_render_in_ssr_and_js_and_reset_when_stale_or_merged(self) -> None:
+    """Checks corpus gate pills render across passed/pending/failed/waived, reset on stale PS,
+    and stay hidden on non-required or merged CLs across slimmed SSR and client JS."""
+    checklist_card = {
+        "work_id": "work-corpus-chk",
+        "title": "SkParagraph review gates",
+        "lane": "needs-you",
+        "work_types": ["reviews"],
+        "needs_you_types": ["reviews"],
+        "reasons": ["Review CLs"],
+        "obligations": [],
+        "checklist": [
+            {
+                "bug_key": "crbug:40042461",
+                "short_id": "crbug/40042461",
+                "title": "TextStyle::equals edging and hinting",
+                "url": "https://issues.chromium.org/issues/40042461",
+                "bug_status": "OPEN",
+                "stage": "review",
+                "stage_tone": "wait",
+                "stage_label": "In review",
+                "cls": [
+                    {
+                        "artifact_key": "gerrit:skia:1427776",
+                        "label": "Gerrit 1427776 PS1",
+                        "url": "https://skia-review.googlesource.com/c/skia/+/1427776",
+                        "subject": "[skparagraph] Compare edging, subpixel and hinting",
+                        "status": "NEW",
+                    },
+                    {
+                        "artifact_key": "gerrit:skia:1408158",
+                        "label": "Gerrit 1408158 PS6",
+                        "url": "https://skia-review.googlesource.com/c/skia/+/1408158",
+                        "subject": "[skparagraph] Check g3 failure pill",
+                        "status": "NEW",
+                    },
+                    {
+                        "artifact_key": "gerrit:skia:1419999",
+                        "label": "Gerrit 1419999 PS3",
+                        "url": "https://skia-review.googlesource.com/c/skia/+/1419999",
+                        "subject": "[skparagraph] Uploaded PS3 after PS2 corpus pass",
+                        "status": "NEW",
+                    },
+                    {
+                        "artifact_key": "gerrit:skia:1406297",
+                        "label": "Gerrit 1406297 PS3",
+                        "url": "https://skia-review.googlesource.com/c/skia/+/1406297",
+                        "subject": "[skparagraph] Soft hyphen when justifying",
+                        "status": "MERGED",
+                    },
+                    {
+                        "artifact_key": "gerrit:skia:1430001",
+                        "label": "Gerrit 1430001 PS1",
+                        "url": "https://skia-review.googlesource.com/c/skia/+/1430001",
+                        "subject": "[ganesh] Non-paragraph GPU cleanup",
+                        "status": "NEW",
+                    },
+                    {
+                        "artifact_key": "github_pr:flutter/flutter:194980",
+                        "label": "PR #194980",
+                        "url": "https://github.com/flutter/flutter/pull/194980",
+                        "subject": "[web_ui] Multi-span BiDi layout",
+                        "status": "OPEN",
+                    },
+                ],
+            }
+        ],
+        "artifacts": [
+            {
+                "artifact_key": "gerrit:skia:1427776",
+                "kind": "gerrit",
+                "role": "primary",
+                "title": "1427776: [skparagraph] Compare edging, subpixel and hinting",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1427776",
+                "state": {
+                    "kind": "gerrit",
+                    "status": "NEW",
+                    "patchset": 1,
+                    "triage": {
+                        "triaged_patchset": 1,
+                        "corpus_required": True,
+                        "corpus_status": "passed",
+                        "corpus_tested_patchset": 1,
+                        "corpus_script": "run_flutter_paragraph_tests.py",
+                        "g3_corpus_required": True,
+                        "g3_corpus_status": "passed",
+                        "g3_corpus_tested_patchset": 1,
+                    },
+                },
+            },
+            {
+                "artifact_key": "gerrit:skia:1408158",
+                "kind": "gerrit",
+                "role": "primary",
+                "title": "1408158: [skparagraph] Check g3 failure pill",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1408158",
+                "state": {
+                    "kind": "gerrit",
+                    "status": "NEW",
+                    "patchset": 6,
+                    "triage": {
+                        "triaged_patchset": 6,
+                        "corpus_required": True,
+                        "corpus_status": "passed",
+                        "corpus_tested_patchset": 6,
+                        "corpus_script": "run_flutter_paragraph_tests.py",
+                        "g3_corpus_required": True,
+                        "g3_corpus_status": "failed",
+                        "g3_corpus_tested_patchset": 6,
+                    },
+                },
+            },
+            {
+                "artifact_key": "gerrit:skia:1419999",
+                "kind": "gerrit",
+                "role": "primary",
+                "title": "1419999: [skparagraph] Uploaded PS3 after PS2 corpus pass",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1419999",
+                "state": {
+                    "kind": "gerrit",
+                    "status": "NEW",
+                    "patchset": 3,
+                    "triage": {
+                        "triaged_patchset": 2,
+                        "corpus_required": True,
+                        "corpus_status": "passed",
+                        "corpus_tested_patchset": 2,
+                        "corpus_script": "run_flutter_paragraph_tests.py",
+                        "g3_corpus_required": True,
+                        "g3_corpus_status": "passed",
+                        "g3_corpus_tested_patchset": 2,
+                    },
+                },
+            },
+            {
+                "artifact_key": "gerrit:skia:1406297",
+                "kind": "gerrit",
+                "role": "primary",
+                "title": "1406297: [skparagraph] Soft hyphen when justifying",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1406297",
+                "state": {
+                    "kind": "gerrit",
+                    "status": "MERGED",
+                    "patchset": 3,
+                    "entity_state": {
+                        "is_triage_stale": True,
+                        "combined_gate_state": {
+                            "anyRequired": True,
+                            "status": "pending",
+                            "activeLabel": "Flutter + google3 A/B",
+                            "passedLabel": "",
+                        },
+                    },
+                },
+            },
+            {
+                "artifact_key": "gerrit:skia:1430001",
+                "kind": "gerrit",
+                "role": "primary",
+                "title": "1430001: [ganesh] Non-paragraph GPU cleanup",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1430001",
+                "state": {
+                    "kind": "gerrit",
+                    "status": "NEW",
+                    "patchset": 1,
+                    "triage": {"corpus_required": False, "g3_corpus_required": False},
+                },
+            },
+            {
+                "artifact_key": "github_pr:flutter/flutter:194980",
+                "kind": "github_pr",
+                "role": "primary",
+                "title": "194980: [web_ui] Multi-span BiDi layout",
+                "url": "https://github.com/flutter/flutter/pull/194980",
+                "state": {
+                    "kind": "github_pr",
+                    "status": "OPEN",
+                    "head_sha": "abc1234def5678",
+                    "triage": {
+                        "triaged_revision": "abc1234",
+                        "corpus_required": True,
+                        "corpus_status": "passed",
+                        "corpus_tested_sha": "abc1234",
+                        "corpus_script": "run_webparagraph_corpus.py",
+                        "g3_corpus_required": True,
+                    },
+                },
+            },
+        ],
+    }
+    standalone_card = {
+        "work_id": "work-corpus-standalone",
+        "title": "Standalone corpus CLs",
+        "lane": "needs-you",
+        "work_types": ["reviews"],
+        "needs_you_types": ["reviews"],
+        "reasons": ["Audit corpus pending"],
+        "obligations": [],
+        "checklist": [],
+        "artifacts": [
+            {
+                "artifact_key": "gerrit:skia:1420296",
+                "kind": "gerrit",
+                "role": "primary",
+                "title": "1420296: [skparagraph] Partial pending gate",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1420296",
+                "state": {
+                    "kind": "gerrit",
+                    "status": "NEW",
+                    "patchset": 3,
+                    "entity_state": {
+                        "is_triage_stale": False,
+                        "combined_gate_state": {
+                            "anyRequired": True,
+                            "status": "pending",
+                            "activeLabel": "Flutter corpus",
+                            "passedLabel": "google3 A/B",
+                        },
+                    },
+                },
+            },
+            {
+                "artifact_key": "gerrit:skia:1409696",
+                "kind": "gerrit",
+                "role": "channel",
+                "title": "1409696: [skparagraph] Waived corpus gate",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1409696",
+                "state": {
+                    "kind": "gerrit",
+                    "status": "NEW",
+                    "patchset": 5,
+                    "entity_state": {
+                        "is_triage_stale": False,
+                        "combined_gate_state": {
+                            "anyRequired": True,
+                            "status": "waived",
+                            "activeLabel": "Flutter corpus",
+                            "passedLabel": "google3 A/B",
+                        },
+                    },
+                },
+            },
+        ],
+    }
+
+    raw_proj = _make_projection(checklist_card, standalone_card)
+    slim_proj = workbench_server.slim_ui_projection(raw_proj)
+
+    # Verify _slim_artifact drops bulky triage dict while keeping compact corpus_gate + search_text
+    slim_1427776 = slim_proj["works"][0]["artifacts"][0]["state"]
+    self.assertNotIn("triage", slim_1427776)
+    self.assertEqual(
+        slim_1427776.get("corpus_gate"),
+        {"status": "passed", "label": "Flutter + google3 A/B OK"},
+    )
+    self.assertIn("flutter + google3 a/b ok", slim_proj["works"][0]["search_text"])
+
+    for label_mode, proj in (("slim", slim_proj), ("raw", raw_proj)):
+      full_html = workbench_server.render_workbench_html(
+          proj, ui_version=11, _already_slim=(label_mode == "slim")
+      )
+      ssr_only = full_html.split("<script>", 1)[0]
+
+      expected_tags = [
+          ('passed', 'Flutter + google3 A/B OK'),
+          ('failed', 'google3 A/B failed'),
+          ('pending', 'Flutter + google3 A/B pending'),
+          ('passed', 'WebParagraph corpus OK'),
+          ('pending', 'google3 A/B OK · Flutter corpus pending'),
+          ('waived', 'Flutter corpus waived'),
+      ]
+      for gate_st, gate_lbl in expected_tags:
+        self.assertIn(
+            f'data-gate-status="{gate_st}">{gate_lbl}</span>',
+            ssr_only,
+            msg=f"Missing SSR corpus pill ({gate_st}, {gate_lbl}) in mode={label_mode}",
+        )
+      ssr_pills = re.findall(
+          r'<span class="wb-cl-tag wb-corpus-tag"[^>]*>([^<]+)</span>', ssr_only
+      )
+      self.assertEqual(len(ssr_pills), 6, msg=f"Unexpected extra SSR pills in mode={label_mode}")
+      for pill_txt in ssr_pills:
+        self.assertIsNone(
+            re.search(r"[\U0001f300-\U0001faff\u2600-\u27bf]", pill_txt),
+            msg=f"Emoji forbidden inside .wb-corpus-tag: {pill_txt}",
+        )
+
+    # Verify client JS renders slimmed/unslimmed pills and keeps failed corpus peers unfolded
+    waiting_failed_card = {
+        "work_id": "work-waiting-failed-corpus",
+        "title": "Waiting card with failed corpus gate",
+        "lane": "waiting",
+        "work_types": ["reviews"],
+        "needs_you_types": [],
+        "reasons": [],
+        "obligations": [],
+        "checklist": [],
+        "artifacts": [
+            {
+                "artifact_key": "gerrit:skia:1408158",
+                "kind": "gerrit",
+                "role": "primary",
+                "title": "1408158: [skparagraph] Failed corpus gate in waiting lane",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1408158",
+                "state": {
+                    "kind": "gerrit",
+                    "status": "NEW",
+                    "patchset": 6,
+                    "assigned_reviewers_count": 1,
+                    "corpus_gate": {"status": "failed", "label": "google3 A/B failed"},
+                },
+            }
+        ],
+    }
+    unslimmed_js_proj = _make_projection(standalone_card, waiting_failed_card)
+    for js_mode, js_proj, expected_js in (
+        ("slim", slim_proj, expected_tags),
+        (
+            "unslimmed_entity_state",
+            unslimmed_js_proj,
+            [
+                ("pending", "google3 A/B OK · Flutter corpus pending"),
+                ("waived", "Flutter corpus waived"),
+                ("failed", "google3 A/B failed"),
+            ],
+        ),
+    ):
+      script_js = _extract_script(workbench_server.render_workbench_html(js_proj, ui_version=11))
+      node_code = (
+          _node_harness_prefix()
+          + f"\nglobal.__latestState = {json.dumps(js_proj)};\n"
+          + script_js
+          + f"\nconst expected = {json.dumps(expected_js)};\n"
+          + f"\nconst jsMode = {json.dumps(js_mode)};\n"
+          + r"""
+const html = els['wb-cards-container'].innerHTML;
+const matches = [
+  ...html.matchAll(
+    /<span class="wb-cl-tag wb-corpus-tag"[^>]*data-gate-status="([^"]+)"[^>]*>([^<]+)<\/span>/g
+  ),
+].map((m) => [m[1], m[2]]);
+assert.deepStrictEqual(matches, expected);
+for (const [, txt] of matches) {
+  assert(!/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(txt), 'No emoji in corpus pill: ' + txt);
+}
+if (jsMode === 'unslimmed_entity_state') {
+  assert(
+    html.includes('Action 1/1'),
+    'Waiting card with failed corpus gate must count as needing attention in Smart mode',
+  );
+}
+"""
+      )
+      proc = subprocess.run(["node", "-e", node_code], capture_output=True, text=True, check=False)
+      self.assertEqual(
+          proc.returncode,
+          0,
+          msg=f"Node failed ({js_mode}):\n{proc.stderr}\n{proc.stdout}",
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

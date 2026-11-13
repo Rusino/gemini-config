@@ -606,9 +606,10 @@ def build_audit_prompt(
     save_flags: list[str] = []
     if gates["flutter_corpus"]:
         fl_out = f"/tmp/flutter_cl_{tid}_ps{cur_ps}"
+        # Pass --full so non-targeted Flutter suites stay covered while Canary-Flutter times out
         gate_cmds.append(
             "Flutter corpus (`python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/"
-            f"scripts/run_flutter_paragraph_tests.py --out {fl_out}`)"
+            f"scripts/run_flutter_paragraph_tests.py --full --out {fl_out}`)"
         )
         save_flags.append(f"--compare-md {fl_out}/compare.md")
     if gates["g3_corpus"]:
