@@ -2403,6 +2403,7 @@ class TestPreToolGuard(unittest.TestCase):
       self.assertIn("[LEGACY-MODEL GUARD]", reason, cmd)
       self.assertIn("gemini-4-carbon-high", reason, cmd)
     for cmd in ('agentapi new-conversation --model=flash "go"',
+                'agentapi new-conversation --model=flash_lite "go"',
                 'agentapi new-conversation --model=gemini-4-carbon-high "go"',
                 'grep "agentapi new-conversation --model=pro" notes.md'):
       self.assertEqual(deny("run_command", {"CommandLine": cmd}), "", cmd)
@@ -2434,6 +2435,38 @@ class TestPreToolGuard(unittest.TestCase):
     out = json.loads(mock_out.getvalue())
     self.assertEqual(out.get("decision"), "deny")
     self.assertIn("[LEGACY-MODEL GUARD]", out.get("reason", ""))
+
+  # Both the hallucinated-subcommand hint and the auto-injected `--model` on
+  # `agentapi new-conversation` must read `chat_lifecycle.AGENTAPI_SAFE_PRO_MODEL`
+  # so rotating the safe default in one place updates every guard path
+  def test_agentapi_main_follows_safe_pro_model_constant(self):
+    import chat_lifecycle
+
+    sentinel = "gemini-4-sentinel-high"
+    with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+        chat_lifecycle, "AGENTAPI_SAFE_PRO_MODEL", sentinel
+    ):
+      summary_file = os.path.join(tmp_dir, "handoff_summary_123.md")
+      with open(summary_file, "w", encoding="utf-8") as f:
+        f.write("# Summary\n")
+      bad_out = self.run_guard({
+          "conversationId": "c1",
+          "toolCall": {"name": "run_command", "args": {"CommandLine": "agentapi start 'hi'"}},
+      })
+      self.assertEqual(bad_out.get("decision"), "deny", f"got {bad_out}")
+      self.assertIn(f"--model={sentinel}", bad_out.get("reason", ""), f"got {bad_out}")
+
+      rewrite_out = self.run_guard({
+          "conversationId": "c1",
+          "artifactDirectoryPath": tmp_dir,
+          "toolCall": {
+              "name": "run_command",
+              "args": {"CommandLine": f'agentapi new-conversation "Read {summary_file}"'},
+          },
+      })
+      self.assertEqual(rewrite_out.get("decision"), "allow", f"got {rewrite_out}")
+      rewritten = (rewrite_out.get("overwrite") or {}).get("CommandLine", "")
+      self.assertIn(f"--model={sentinel}", rewritten, f"got {rewritten}")
 
 
 if __name__ == "__main__":

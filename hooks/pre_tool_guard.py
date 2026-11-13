@@ -6133,6 +6133,11 @@ def main() -> None:
       if "agentapi" in cmd_non_inspect and not re.match(
           r"^\s*python3?\b", cmd_non_inspect
       ):
+        _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+        if _hooks_dir not in sys.path:
+          sys.path.insert(0, _hooks_dir)
+        from chat_lifecycle import AGENTAPI_SAFE_PRO_MODEL
+
         new_title = state.get("pending_title") or build_continuation_title(
             conv_id, ""
         )
@@ -6151,8 +6156,10 @@ def main() -> None:
                   {
                       "decision": "deny",
                       "reason": (
-                          f"[PRE-TOOL GUARD] Subcommand `agentapi {bad_subcmd.group(1)}` does not exist! "
-                          f"Use this EXACT command:\n`{cmd_prefix} --model=gemini-4-carbon-high --title=\"{new_title}\" \"<prompt>\"`"
+                          f"[PRE-TOOL GUARD] Subcommand `agentapi {bad_subcmd.group(1)}` "
+                          "does not exist! Use this EXACT command:\n"
+                          f"`{cmd_prefix} --model={AGENTAPI_SAFE_PRO_MODEL}"
+                          f' --title="{new_title}" "<prompt>"`'
                       ),
                   },
                   ensure_ascii=False,
@@ -6284,7 +6291,9 @@ def main() -> None:
 
           if "--model" not in rewritten:
             rewritten = AGENTAPI_NEW_CONV_RE.sub(
-                lambda m: f"{m.group(0)} --model=gemini-4-carbon-high", rewritten, count=1
+                lambda m: f"{m.group(0)} --model={AGENTAPI_SAFE_PRO_MODEL}",
+                rewritten,
+                count=1,
             )
             needs_rewrite = True
 

@@ -3667,6 +3667,7 @@ class TestLegacyModelBan(unittest.TestCase):
     self.assertEqual(arg("pro"), chat_lifecycle.AGENTAPI_SAFE_PRO_MODEL)
     self.assertEqual(arg("gemini-2.5-flash"), chat_lifecycle.AGENTAPI_SAFE_PRO_MODEL)
     self.assertEqual(arg("flash"), "flash")
+    self.assertEqual(arg("flash_lite"), "flash_lite")
     self.assertEqual(arg("gemini-3.8-flash-high"), "gemini-3.8-flash-high")
     self.assertFalse(chat_lifecycle.is_legacy_model(chat_lifecycle.AGENTAPI_SAFE_PRO_MODEL))
 
