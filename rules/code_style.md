@@ -51,7 +51,9 @@ description: "When editing source code or tests, writing code comments, commit m
   for states no constructor or builder produces (check the producer and sibling path first)
 - Root-cause fixes only: no special-case branch for one failing input; when special cases
   accumulate, reshape the data structure or lookup table instead of chaining `if`/`else`, keeping
-  layout, hit-testing, caret, selection and rendering consistent
+  layout, hit-testing, caret, selection and rendering consistent. A new path beside the existing
+  one, or a fallback into the path that has the bug, is a symptom fix: feed the existing path
+  the right data instead
 - Lookup tables (`ES.28`, `SL.con.1`): in C++, use `std::array<T, N>`: `constexpr` when
   compile-time computable, else a function-local `static const auto kTable = [] {
   std::array<T, N> a{}; ... return a; }();` (`SkNoDestructor` only when `T` is not trivially

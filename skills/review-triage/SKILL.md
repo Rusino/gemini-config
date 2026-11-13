@@ -62,6 +62,7 @@ Instead of generating passive summaries that numb critical thinking, this skill 
   2. Pinpoints the **top 1–2 hunks (20–50 lines)** where state mutations or branching algorithms actually change.
   3. Provides exact clickable links: `[File.cpp:L120–L150]`.
   4. Formulates **3–4 domain invariant checks** (Hot-path zero-allocation, boundary/empty handling, BiDi run boundaries, cache invalidation).
+  5. Runs the **Fix Completeness** axis of [`hunter_prompt.md`](../amnesia-precommit/references/hunter_prompt.md) on the whole CL: fallbacks into the buggy path (read the predicate, e.g. a feature flag), a parallel path copied next to the existing one, tests whose oracle cannot tell old from new, op/blob counts vs. the reference API, unmeasured caches, and waived size/perf CI failures.
 - **User Action**: Read **ONLY** the pinpointed 20–50 lines with personal critical eyes. Brain engages fully, analytical edge is sharpened, 95% of reading time is saved.
 
 ### 4. 🟠 `[PUSHBACK / HYGIENE REQUIRED]` (User time: 1 minute)
