@@ -2581,11 +2581,18 @@
         selfWait.generic && cachedMatches && cachedTraj.state === 'blocked' && cachedTraj.detail
           ? cachedTraj.detail
           : selfWait.detail;
+      const blockedSig = `self:${selfWait.stepIndex}:${detail}`;
+      // Overwrite prior 'running' cache state when summary waitingSteps pauses the turn without RPC
+      if (cachedTraj && !cachedTraj.inFlight && cachedTraj.state === 'running') {
+        cachedTraj.state = 'blocked';
+        cachedTraj.detail = detail;
+        cachedTraj.blockedSig = blockedSig;
+      }
       return {
         bucket: 'needs-me',
         isBlocked: true,
         blockedDetail: detail,
-        blockedSig: `self:${selfWait.stepIndex}:${detail}`,
+        blockedSig,
         workingDetail: '',
       };
     }
@@ -12016,32 +12023,33 @@
     if (!cid) return;
     // Flush any deferred passive-view model switch toast when focusing or typing in the composer
     flushPendingAutopilotToast(findReduxStore(), cid);
-    if (latchedNeedsMeModMs.has(cid)) {
+    // React auto-focuses the editor on row click and background click, so never dismiss on focusin
+    if (event.type === 'focusin') return;
+    const summariesMap =
+      findReduxStore()?.getState()?.trajectorySummaries?.summaries || {};
+    const summary = summariesMap[cid];
+    if (!summary) return;
+    // Skip O(N) descendant index rebuild on repeated keystrokes in an already-seen chat
+    if (
+      event.type === 'keydown' &&
+      !latchedNeedsMeModMs.has(cid) &&
+      !summary.annotations?.markedAsUnread &&
+      !extractSummaryWaitingInfo(summary) &&
+      trajectoryStatusCache.get(cid)?.state !== 'blocked' &&
+      (locallySeenModifiedMs.get(cid) || 0) >=
+        (parseTimestampMs(summary.lastModifiedTime) || parseTimestampMs(summary.createdTime))
+    ) {
+      return;
+    }
+    // Never pre-dismiss while the conversation is still working before completion
+    const statusInfo = resolveConversationStatus(cid, summary, '', summariesMap);
+    // Blocked prompts (ask_question, permission, elicitation) stay until answered or dismissed
+    if (
+      !statusInfo.isBlocked &&
+      statusInfo.bucket === 'needs-me' &&
+      (latchedNeedsMeModMs.has(cid) || isUnseenNeedsReaction(cid, summary, statusInfo))
+    ) {
       markConversationSeen(cid);
-    } else {
-      const summariesMap =
-        findReduxStore()?.getState()?.trajectorySummaries?.summaries || {};
-      const summary = summariesMap[cid];
-      if (!summary) return;
-      // Skip O(N) descendant index rebuild on repeated keystrokes in an already-seen chat
-      if (
-        event.type === 'keydown' &&
-        !summary.annotations?.markedAsUnread &&
-        !extractSummaryWaitingInfo(summary) &&
-        trajectoryStatusCache.get(cid)?.state !== 'blocked' &&
-        (locallySeenModifiedMs.get(cid) || 0) >=
-          (parseTimestampMs(summary.lastModifiedTime) || parseTimestampMs(summary.createdTime))
-      ) {
-        return;
-      }
-      // Never pre-dismiss while the conversation is still working before completion
-      const statusInfo = resolveConversationStatus(cid, summary, '', summariesMap);
-      if (
-        statusInfo.bucket === 'needs-me' &&
-        isUnseenNeedsReaction(cid, summary, statusInfo)
-      ) {
-        markConversationSeen(cid);
-      }
     }
   }
 
@@ -12167,6 +12175,7 @@
 
     // Live blocked steps (self or subagent) stay visible until resolved or explicitly dismissed
     if (resolvedStatus.isBlocked) {
+      latchedNeedsMeModMs.delete(cascadeId);
       if (
         resolvedStatus.blockedSig &&
         dismissedBlockedSigs.get(cascadeId) === resolvedStatus.blockedSig
@@ -12758,7 +12767,8 @@
             bucket === 'needs-me' &&
             wasRealWorking &&
             rawModTs > 0 &&
-            (statusInfo.isBlocked || ageMs < STALE_THRESHOLD_MS)
+            !statusInfo.isBlocked &&
+            ageMs < STALE_THRESHOLD_MS
           ) {
             latchedNeedsMeModMs.set(cascadeId, rawModTs);
           }

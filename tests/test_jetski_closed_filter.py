@@ -2699,17 +2699,30 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'false');
   delete inboxListEl.scrollHeight;
 
-  // Clicking an inbox row navigates to that conversation, but does NOT dismiss it
+  // Clicking an inbox row navigates to that conversation, and neither React auto-focus
+  // (focusin) nor input-box clicks/typing dismiss an unanswered blocked question
+  const agentInputBox = new FakeElement('div');
+  agentInputBox.setAttribute('data-testid', 'agent-input-box');
+  agentInputBox.setAttribute('data-cascade-id', 'urgent-question');
+  bodyEl.appendChild(agentInputBox);
   window.history._lastPushed = null;
   advanceClock();
   inboxRows[0].dispatchEvent('pointerdown', { button: 0 });
   inboxRows[0].dispatchEvent('click', { button: 0 });
+  agentInputBox.dispatchEvent('focusin');
+  agentInputBox.dispatchEvent('pointerdown', { button: 0 });
+  agentInputBox.dispatchEvent('keydown', {
+    key: 'a',
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+  });
   assert.strictEqual(window.history._lastPushed, '/c/urgent-question');
   assert(window.__jetskiManualVisitedCids.has('urgent-question'));
   assert.strictEqual(
     inboxEl.getAttribute('data-count'),
     '3',
-    'Clicking row must navigate without dismissing from Needs Me'
+    'Clicking row, auto-focusing, or typing in input box must not dismiss blocked question'
   );
   assert.strictEqual(inboxEl.getAttribute('data-urgent-count'), '1');
 
@@ -2724,11 +2737,16 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '2');
   assert.strictEqual(urgentPill.style.display, 'none');
 
-  // Focusing or clicking inside the prompt input box dismisses the active conversation
-  const agentInputBox = new FakeElement('div');
-  agentInputBox.setAttribute('data-testid', 'agent-input-box');
+  // Programmatic focusin on switching to an unblocked unread chat must not dismiss it;
+  // real pointerdown inside the prompt input box dismisses it
   agentInputBox.setAttribute('data-cascade-id', 'urgent-unread');
-  bodyEl.appendChild(agentInputBox);
+  advanceClock();
+  agentInputBox.dispatchEvent('focusin');
+  assert.strictEqual(
+    inboxEl.getAttribute('data-count'),
+    '2',
+    'Programmatic focusin on prompt input box must not dismiss unread conversation'
+  );
   advanceClock();
   agentInputBox.dispatchEvent('pointerdown', { button: 0 });
   assert.strictEqual(
@@ -11481,12 +11499,115 @@ const flushAll = async () => {
     assert.strictEqual(rows.length, 1);
     assert.strictEqual(rows[0].getAttribute('data-cascade-id'), 'chat-open-pane');
 
-    // Clicking input box AFTER completion dismisses chat-open-pane cleanly
+    // Auto-focus (focusin) after completion must NOT clear latch; pointerdown dismisses cleanly
+    Date.now = () => Date.parse('2026-11-02T17:42:45Z');
+    openPaneInput.dispatchEvent('focusin');
+    await flushAll();
+    assert.strictEqual(
+      window.__jetskiLatchedNeedsMeModMs.has('chat-open-pane'),
+      true,
+      'focusin on agent-input-box must not clear Working -> Needs Me latch'
+    );
+    assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '1');
+
     Date.now = () => Date.parse('2026-11-02T17:43:00Z');
     openPaneInput.dispatchEvent('pointerdown', { button: 0 });
     await flushAll();
     assert.strictEqual(window.__jetskiLatchedNeedsMeModMs.has('chat-open-pane'), false);
     assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '0');
+
+    // R148: Working -> blocked (ask_question) stays in Needs Me across focusin, pointerdown,
+    // and keydown on agent-input-box until waitingSteps clears
+    reduxStore.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: {
+        updates: [[
+          'chat-open-pane',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-open-pane'],
+            status: 'CASCADE_RUN_STATUS_RUNNING',
+            notFullyIdle: true,
+            lastModifiedTime: '2026-11-02T17:43:10Z',
+          },
+        ]],
+        deletes: [],
+      },
+    });
+    await flushAll();
+    reduxStore.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: {
+        updates: [[
+          'chat-open-pane',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-open-pane'],
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: false,
+            stepCount: 92,
+            waitingSteps: [{
+              stepIndex: 91,
+              step: {
+                status: 9,
+                type: 15,
+                plannerResponse: {
+                  toolCalls: [{ name: 'ask_question', argumentsJson: '{}' }],
+                },
+              },
+            }],
+            lastModifiedTime: '2026-11-02T17:43:20Z',
+            annotations: {
+              title: '[13:30] ⦿ Testing without canaries',
+              archived: false,
+              lastUserViewTime: '2026-11-02T17:43:21Z',
+            },
+          },
+        ]],
+        deletes: [],
+      },
+    });
+    await flushAll();
+    assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '1');
+    Date.now = () => Date.parse('2026-11-02T17:43:30Z');
+    openPaneInput.dispatchEvent('focusin');
+    openPaneInput.dispatchEvent('pointerdown', { button: 0 });
+    openPaneInput.dispatchEvent('keydown', {
+      key: 'x',
+      ctrlKey: false,
+      metaKey: false,
+      altKey: false,
+    });
+    await flushAll();
+    assert.strictEqual(
+      tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent,
+      '1',
+      'Blocked ask_question chat must remain in Needs Me despite input-box focusin/pointerdown/keydown'
+    );
+    // Answering/clearing waitingSteps while viewing pane clears Needs Me without stale latch
+    reduxStore.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: {
+        updates: [[
+          'chat-open-pane',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-open-pane'],
+            waitingSteps: [],
+            lastModifiedTime: '2026-11-02T17:43:40Z',
+            annotations: {
+              title: '[13:30] ⦿ Testing without canaries',
+              archived: false,
+              lastUserViewTime: '2026-11-02T17:43:41Z',
+            },
+          },
+        ]],
+        deletes: [],
+      },
+    });
+    await flushAll();
+    assert.strictEqual(
+      tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent,
+      '0',
+      'Resolved ask_question in viewed pane must leave Needs Me cleanly'
+    );
 
     // UI-B1 & UI-G1: external archive clears latch, and keydown in focused box dismisses in O(1)
     reduxStore.dispatch({
