@@ -512,6 +512,75 @@ def compute_equivalent_patchsets(info: dict[str, Any], cur_ps: int) -> list[int]
   return sorted(eq_ps)
 
 
+AUTHORS_EMAIL_PATTERN_RE = re.compile(r" <([^>]+)>")
+BEHDAD_EXEMPT_AUTHORS = frozenset({
+    "behdad.esfahbod@gmail.com",
+    "behdad",
+    "behdad esfahbod",
+})
+
+
+def _evaluate_authors_gate(
+    host: str,
+    info: dict[str, Any],
+    files: Sequence[str],
+    authors_text_override: str | None = None,
+) -> dict[str, Any]:
+  """Verify external Gerrit author presence in AUTHORS before CR+1 finalization."""
+  owner_obj = info.get("owner") or {}
+  owner_email = str(owner_obj.get("email") or "").strip()
+  owner_name = str(owner_obj.get("name") or "").strip()
+  cur_sha = str(info.get("current_revision") or "")
+  cur_rev = ((info.get("revisions") or {}).get(cur_sha)) or {}
+  commit_author = ((cur_rev.get("commit") or {}).get("author")) or {}
+  commit_email = str(commit_author.get("email") or "").strip()
+  eff_email = commit_email or owner_email
+  low_email = eff_email.lower()
+  low_name = owner_name.lower()
+  is_ext = (
+      bool(low_email and "@" in low_email)
+      and not low_email.endswith(("@google.com", "@chromium.org", ".gserviceaccount.com"))
+      and not low_email.startswith(("skia-autoroll@", "chromium-autoroll@", "autoroll"))
+  )
+  if not is_ext or not any(h in str(host or "").lower() for h in ("skia-review", "chromium-review")):
+    return {"required": False, "status": "not_required", "email": eff_email}
+  if low_email in BEHDAD_EXEMPT_AUTHORS or low_name in BEHDAD_EXEMPT_AUTHORS:
+    return {"required": False, "status": "exempt", "email": eff_email}
+  if "AUTHORS" in (files or ()):
+    return {"required": True, "status": "passed", "source": "cl_files", "email": eff_email}
+  if authors_text_override is not None:
+    body = authors_text_override
+  else:
+    authors_path = os.path.join(SKIA_CHECKOUT_DIR, "AUTHORS")
+    if not os.path.isfile(authors_path):
+      return {"required": False, "status": "skipped_no_file", "email": eff_email}
+    try:
+      with open(authors_path, "r", encoding="utf-8", errors="replace") as fh:
+        body = fh.read()
+    except OSError:
+      return {"required": False, "status": "skipped_no_file", "email": eff_email}
+  for raw_line in body.splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+      continue
+    m = AUTHORS_EMAIL_PATTERN_RE.search(line)
+    if not m:
+      continue
+    pat = m.group(1).strip().replace(".", r"\.").replace("*", ".*")
+    try:
+      if re.match(rf"^{pat}$", eff_email, re.IGNORECASE):
+        return {
+            "required": True,
+            "status": "passed",
+            "source": "repo_authors",
+            "matched_entry": line,
+            "email": eff_email,
+        }
+    except re.error:
+      continue
+  return {"required": True, "status": "missing", "email": eff_email}
+
+
 # Evaluate SkCQ and LUCI CV dry-run status across equivalent patchsets of cur_ps
 def evaluate_cq_dry_run_gate(
     info: dict[str, Any], cur_ps: int | None = None
@@ -917,6 +986,12 @@ def build_finalize_preview(
       _memo_bb(cl_id, cur_ps) if host == DEFAULT_GERRIT_HOST else {},
       eff_citc,
   )
+  authors_gate = _evaluate_authors_gate(host, info, files)
+  if authors_gate["required"] and authors_gate["status"] == "missing":
+    blockers.append(
+        f"External author {authors_gate['email']} is missing from AUTHORS "
+        "(verify CLA + add to AUTHORS before CR+1)"
+    )
   cq_gate = evaluate_cq_dry_run_gate(info, cur_ps=cur_ps)
   raw_armed = parent_rec.get("armed_finalize")
   armed_finalize = None
@@ -955,6 +1030,7 @@ def build_finalize_preview(
           "flutter_corpus": {"required": corpus_req, "status": c_status},
           "g3_corpus": g3_gate,
           "asan": asan_gate,
+          "authors": authors_gate,
           "cq_dry_run": cq_gate,
       },
       "drafts": drafts_list,
