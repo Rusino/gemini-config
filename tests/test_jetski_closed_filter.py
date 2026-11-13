@@ -7431,6 +7431,18 @@ global.clearTimeout = (id) => {
     `cpp-core draft must auto-select Opus 5.5 Medium (1369), got: ${storeState.modelSelection.default.model}`
   );
 
+  // 2b. Draft chat auto-selection for TextClusters API (?section=<TextClusters UUID> -> cpp-core)
+  storeState.modelSelection.default.model = 1260;
+  global.window.location.search = '?section=42497f18-ff9d-4fd5-9e8b-e666147873c9';
+  reduxStore.dispatch({ type: 'NOOP' });
+  await new Promise((r) => setImmediate(r));
+
+  assert.strictEqual(
+    storeState.modelSelection.default.model,
+    1369,
+    `TextClusters API draft must auto-select Opus 5.5 Medium (1369), got: ${storeState.modelSelection.default.model}`
+  );
+
   // 3. Draft chat in skia-g3-roll-check (?section=<skia-g3-roll-check UUID> -> triage)
   global.window.location.search = '?section=3f5b7a12-8e5f-47d2-a2f4-d644447c86a8';
   reduxStore.dispatch({ type: 'NOOP' });
@@ -13078,6 +13090,20 @@ eval(code);
     self.assertLess(py_triage.index("hydrogen-l-tf-high"), py_triage.index("gemini-3.8-flash-high"))
     for senior_key in ("cpp-core", "orchestrator"):
       self.assertFalse(any("hydrogen" in mid.lower() for mid in cl.MODEL_PROFILES[senior_key]))
+
+  # TextClusters API must map to cpp-core by both project UUID and normalized title
+  def test_textclusters_api_mapped_to_cpp_core_profile(self):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "scripts", "jetski_closed_filter.js"), encoding="utf-8") as f:
+      js_src = f.read()
+    self.assertRegex(
+        js_src,
+        r"'42497f18-ff9d-4fd5-9e8b-e666147873c9':\s*'cpp-core'",
+    )
+    self.assertRegex(
+        js_src,
+        r"'textclusters api':\s*'cpp-core'",
+    )
 
 
 if __name__ == "__main__":

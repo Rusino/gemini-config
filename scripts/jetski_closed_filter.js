@@ -704,20 +704,20 @@
   const PROJECT_MODEL_PROFILES = {
     // triage profile (sidecar IDs)
     'skia-g3-roll-check': 'triage',
-    // cpp-core profile (only SkParagraph, Skia, and SkoreText start immediately on Opus 5.5)
+    // cpp-core profile (SkParagraph, Skia, SkoreText, and TextClusters API start on Opus 5.5)
     '8acb67c4-2cb7-43ca-ba04-dc547b3c4788': 'cpp-core',
     'skparagraph': 'cpp-core',
     '9b93560e-8b7f-4b1c-9dfd-8290e4884541': 'cpp-core',
     'skia': 'cpp-core',
     '100deebd-72df-4dbe-a33a-aae6712f994e': 'cpp-core',
     'skoretext': 'cpp-core',
+    '42497f18-ff9d-4fd5-9e8b-e666147873c9': 'cpp-core',
+    'textclusters api': 'cpp-core',
     // orchestrator profile (drains flat gemini-next bucket first unless manually pinned)
     '1a021a3a-e0f3-4f85-ab21-42cfba6cf4d4': 'orchestrator',
     'chromium': 'orchestrator',
     '9571f9cb-06ce-4b6b-9a5d-9aa1ab55c52a': 'orchestrator',
     'lazy android': 'orchestrator',
-    '42497f18-ff9d-4fd5-9e8b-e666147873c9': 'orchestrator',
-    'textclusters api': 'orchestrator',
     'dc42bd7d-5c00-4416-9365-00cb2a59acaa': 'orchestrator',
     'skglyphid to 32 bits': 'orchestrator',
     '83acaa3f-d7d7-412d-9d07-d33229f9a45b': 'orchestrator',

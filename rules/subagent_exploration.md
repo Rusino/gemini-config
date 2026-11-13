@@ -10,7 +10,8 @@ description: "Context hygiene: when to delegate to subagents, which model, and g
   `file:line` lookups); over 15 calls or many items → `run_workflow` or several subagents
 - Models: `Model="flash"` for mechanical lookups (`scout`), test/build runners, log triage and
   routine `keeper_skeptic` batches; `Model="inherit"` for semantic research, root-cause work and
-  `keeper_inquisitor`. Never `Model="pro"` (hook-enforced)
+  `keeper_inquisitor`. Never `Model="pro"` (hook-enforced). `TextClusters API` changes run only
+  on senior `cpp-core` models (never Flash, junior, or two-phase execution models; hook-enforced)
 - Give a subagent at most 150 KB or 10 files per turn (never dump whole `references/`, `g3doc/`
   or module trees); keep static instructions/rubrics at the prompt prefix and dynamic per-turn
   payloads at the tail for KV cache stability

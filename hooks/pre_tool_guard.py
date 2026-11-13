@@ -3470,6 +3470,185 @@ def quota_hold_tool_denial(
     return ""
 
 
+TEXTCLUSTERS_PROJECT_ID = "42497f18-ff9d-4fd5-9e8b-e666147873c9"
+TEXTCLUSTERS_BLINK_PATH_RE = re.compile(
+    r"(?:^|/)(?:"
+    r"text_cluster[s_]?[^/]*\.(?:h|cc|idl|js|html)"
+    r"|shaped_text[^/]*\.(?:h|cc|idl|js|html)"
+    r"|canvas-text-cluster[^/]*\.(?:js|html)"
+    r"|text-clusters[^/]*\.(?:js|html)"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _is_textclusters_api_path(raw_path: str) -> bool:
+  cleaned = (raw_path or "").strip().strip("'\"")
+  if not cleaned:
+    return False
+  norm = os.path.abspath(os.path.expanduser(cleaned)).replace("\\", "/")
+  return bool(TEXTCLUSTERS_BLINK_PATH_RE.search(norm))
+
+
+def _subagent_invoked_flash_model(parent_transcript: str, subagent_conv_id: str) -> str:
+  """Returns the Flash model name ('flash' or 'flash_lite') if subagent_conv_id was spawned on it.
+
+  Inputs: parent_transcript path and subagent_conv_id.
+  Outputs: 'flash', 'flash_lite', or empty string when spawned on inherit/senior model.
+  Side effects: reads parent transcript JSONL steps from disk.
+  """
+  if not parent_transcript or not os.path.isfile(parent_transcript):
+    return ""
+  steps = _load_transcript_steps(parent_transcript, -1)
+  if not steps:
+    try:
+      with open(parent_transcript, "r", encoding="utf-8") as f:
+        steps = [json.loads(ln) for ln in f if ln.strip()]
+    except (OSError, ValueError):
+      return ""
+  pending_models: list[str] = []
+  last_model = ""
+  for step in steps:
+    stype = step.get("type", "")
+    if stype == "PLANNER_RESPONSE":
+      for tc in step.get("tool_calls") or []:
+        if not isinstance(tc, dict) or tc.get("name") != "invoke_subagent":
+          continue
+        args = tc.get("args") or tc.get("arguments") or {}
+        if isinstance(args, str):
+          try:
+            args = json.loads(args)
+          except ValueError:
+            args = {}
+        if not isinstance(args, dict):
+          args = {}
+        m = str(args.get("Model") or args.get("model") or "inherit").strip().lower()
+        pending_models.append(m)
+        last_model = m
+    elif stype == "GENERIC":
+      content = str(step.get("content") or "")
+      if "Created the following subagent" in content or (
+          subagent_conv_id and subagent_conv_id in content
+      ):
+        m = pending_models.pop(0) if pending_models else last_model
+        if subagent_conv_id and subagent_conv_id in content:
+          return m if m in ("flash", "flash_lite") else ""
+  return last_model if last_model in ("flash", "flash_lite") else ""
+
+
+def textclusters_senior_model_denial(
+    tool_name: str,
+    tool_args: dict,
+    conv_id: str,
+    parent_conv_id: str,
+    transcript_path: str,
+    artifact_dir: str,
+    workspace_paths: list[str],
+    current_step_idx: int = -1,
+) -> str:
+  """Blocks edits to TextClusters API files or in the TextClusters API project on junior models.
+
+  Inputs: tool_name, tool_args, conversation/parent IDs, transcript/artifact/workspace paths.
+  Outputs: empty string when allowed on a senior model, or `[TEXTCLUSTERS SENIOR-MODEL GUARD]`.
+  Side effects: reads `.context_guard_state.json`, transcript steps, and project metadata.
+  """
+  if tool_name not in EDIT_TOOLS:
+    return ""
+  raw_target = get_tool_target_file(tool_args)
+  if not raw_target or _is_quota_hold_scratch_path(raw_target, artifact_dir, workspace_paths):
+    return ""
+
+  clean_target = os.path.abspath(os.path.expanduser(raw_target.strip().strip("'\"")))
+  config_root = os.path.realpath(os.path.expanduser("~/.gemini/config"))
+  real_target = os.path.realpath(clean_target)
+  if real_target == config_root or real_target.startswith(config_root + "/"):
+    return ""
+
+  top_conv = (parent_conv_id or conv_id or "").strip()
+  if top_conv == conv_id:
+    top_transcript = transcript_path
+    top_step_idx = current_step_idx
+  else:
+    cand = (
+        transcript_path.replace(conv_id, top_conv)
+        if (conv_id and transcript_path and conv_id in transcript_path)
+        else ""
+    )
+    top_transcript = cand if (cand and os.path.isfile(cand)) else ""
+    top_step_idx = -1
+
+  is_tc_path = _is_textclusters_api_path(clean_target)
+  in_tc_project = os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip() == TEXTCLUSTERS_PROJECT_ID
+  if not is_tc_path and not in_tc_project and top_conv:
+    try:
+      from context_guard import get_conversation_db_info
+
+      _, pid = get_conversation_db_info(top_conv, top_transcript)
+      in_tc_project = (pid or "").strip() == TEXTCLUSTERS_PROJECT_ID
+    except Exception:  # lint: allow-broad-except (guard must never crash hook)
+      in_tc_project = False
+
+  if not is_tc_path and not in_tc_project:
+    return ""
+
+  fname = os.path.basename(clean_target)
+  if parent_conv_id:
+    flash_model = _subagent_invoked_flash_model(top_transcript, conv_id)
+    if flash_model:
+      return (
+          f"[TEXTCLUSTERS SENIOR-MODEL GUARD] Editing `{fname}` for TextClusters API from a "
+          f"`Model=\"{flash_model}\"` subagent is forbidden. TextClusters API changes must be "
+          "authored on a senior `cpp-core` model (Claude Opus 5.5 or Gemini 4 Carbon/Argon "
+          "High), never on Flash or junior models."
+      )
+
+  try:
+    import quota_hold
+
+    if quota_hold.is_orchestrator_execution_turn(
+        top_transcript, conv_id=top_conv, current_step_idx=top_step_idx
+    ):
+      return (
+          f"[TEXTCLUSTERS SENIOR-MODEL GUARD] Editing `{fname}` during an Orchestrator "
+          "two-phase execution turn (e.g. `Gemini Pro Next`) is forbidden. TextClusters API "
+          "changes must be authored directly on a senior `cpp-core` model (Claude Opus 5.5 "
+          "or Gemini 4 Carbon/Argon High)."
+      )
+  except Exception:  # lint: allow-broad-except (guard must never crash hook)
+    pass
+
+  unreliable_label = ""
+  cg_candidates: list[str] = []
+  if artifact_dir:
+    cg_candidates.append(os.path.join(artifact_dir, "scratch", ".context_guard_state.json"))
+    if parent_conv_id and conv_id and conv_id in artifact_dir:
+      cg_candidates.append(
+          os.path.join(
+              artifact_dir.replace(conv_id, parent_conv_id),
+              "scratch",
+              ".context_guard_state.json",
+          )
+      )
+  for cg_state in cg_candidates:
+    if os.path.isfile(cg_state):
+      try:
+        with open(cg_state, "r", encoding="utf-8") as f:
+          unreliable_label = str((json.load(f) or {}).get("unreliable_model_label") or "").strip()
+        if unreliable_label:
+          break
+      except (OSError, ValueError):
+        pass
+
+  if unreliable_label:
+    return (
+        f"[TEXTCLUSTERS SENIOR-MODEL GUARD] Editing `{fname}` for TextClusters API while "
+        f"running on junior/unreliable model `{unreliable_label}` is forbidden. Switch to a "
+        "senior `cpp-core` model (Claude Opus 5.5 or Gemini 4 Carbon/Argon High) before "
+        "modifying TextClusters API code or tests."
+    )
+  return ""
+
+
 def exploration_circuit_breaker_denial(
     tool_name: str,
     tool_args: dict,
@@ -5950,6 +6129,26 @@ def main() -> None:
       print(
           json.dumps(
               {"decision": "deny", "reason": xp_denial}, ensure_ascii=False
+          )
+      )
+      return
+
+  # Require senior cpp-core models for any TextClusters API code/test modifications
+  if tool_name in EDIT_TOOLS:
+    tc_denial = textclusters_senior_model_denial(
+        tool_name,
+        tool_args,
+        conv_id,
+        parent_conv_id,
+        transcript_path,
+        artifact_dir,
+        workspace_paths,
+        step_idx_val,
+    )
+    if tc_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": tc_denial}, ensure_ascii=False
           )
       )
       return

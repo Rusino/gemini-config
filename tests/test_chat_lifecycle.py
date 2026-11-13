@@ -3686,6 +3686,13 @@ class TestLegacyModelBan(unittest.TestCase):
     self.assertNotIn('agentapi tier "pro"', chat_lifecycle.USAGE)
     self.assertNotIn("Gemini 3.1 Pro", chat_lifecycle.USAGE)
 
+  # TextClusters API must route to the senior cpp-core profile (Opus 5.5 / Carbon High)
+  def test_textclusters_api_routes_to_cpp_core_profile(self):
+    self.assertEqual(chat_lifecycle.DEFAULT_PROJECT_MODELS.get("TextClusters API"), "cpp-core")
+    with open(chat_lifecycle.DEFAULT_PROJECT_MODELS_FILE, "r", encoding="utf-8") as f:
+      disk_models = json.load(f)
+    self.assertEqual(disk_models.get("TextClusters API"), "cpp-core")
+
 
 if __name__ == "__main__":
   unittest.main()

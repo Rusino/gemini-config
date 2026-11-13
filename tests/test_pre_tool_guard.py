@@ -2468,6 +2468,144 @@ class TestPreToolGuard(unittest.TestCase):
       rewritten = (rewrite_out.get("overwrite") or {}).get("CommandLine", "")
       self.assertIn(f"--model={sentinel}", rewritten, f"got {rewritten}")
 
+  # TextClusters API files and project edits must require senior cpp-core models
+  def test_textclusters_senior_model_denial_enforces_cpp_core_models(self):
+    import quota_hold
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ws_dir = os.path.join(tmp_dir, "chromium")
+      tc_dir = os.path.join(
+          ws_dir, "third_party", "blink", "renderer", "core", "html", "canvas"
+      )
+      os.makedirs(tc_dir, exist_ok=True)
+      tc_file = os.path.join(tc_dir, "text_cluster.cc")
+      shaped_file = os.path.join(tc_dir, "shaped_text.idl")
+      shared_file = os.path.join(tc_dir, "canvas_rendering_context_2d.cc")
+
+      art_dir = os.path.join(tmp_dir, "art", "parent-conv")
+      os.makedirs(os.path.join(art_dir, "scratch"), exist_ok=True)
+      parent_tr = os.path.join(art_dir, "transcript.jsonl")
+      with open(parent_tr, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "USER_INPUT", "content": "implement TextCluster"}) + "\n")
+
+      # 1. Senior model in normal turn is allowed to edit TextClusters files
+      with patch.object(quota_hold, "is_orchestrator_execution_turn", return_value=False):
+        self.assertEqual(
+            pre_tool_guard.textclusters_senior_model_denial(
+                "edit_file",
+                {"Path": tc_file},
+                "parent-conv",
+                "",
+                parent_tr,
+                art_dir,
+                [ws_dir],
+            ),
+            "",
+        )
+
+      # 2. Orchestrator two-phase execution turn is blocked on TextClusters files
+      with patch.object(quota_hold, "is_orchestrator_execution_turn", return_value=True):
+        reason_exec = pre_tool_guard.textclusters_senior_model_denial(
+            "edit_file",
+            {"Path": shaped_file},
+            "parent-conv",
+            "",
+            parent_tr,
+            art_dir,
+            [ws_dir],
+        )
+        self.assertIn("[TEXTCLUSTERS SENIOR-MODEL GUARD]", reason_exec)
+        self.assertIn("Orchestrator two-phase execution turn", reason_exec)
+
+      # 3. Junior/unreliable model recorded in .context_guard_state.json is blocked
+      cg_state = os.path.join(art_dir, "scratch", ".context_guard_state.json")
+      with open(cg_state, "w", encoding="utf-8") as f:
+        json.dump({"unreliable_model_label": "Gemini 3.8 Flash (High)"}, f)
+      with patch.object(quota_hold, "is_orchestrator_execution_turn", return_value=False):
+        reason_jr = pre_tool_guard.textclusters_senior_model_denial(
+            "edit_file",
+            {"Path": tc_file},
+            "parent-conv",
+            "",
+            parent_tr,
+            art_dir,
+            [ws_dir],
+        )
+        self.assertIn("[TEXTCLUSTERS SENIOR-MODEL GUARD]", reason_jr)
+        self.assertIn("Gemini 3.8 Flash (High)", reason_jr)
+
+        # Shared Blink file in TextClusters API project is also blocked on junior model
+        with patch.dict(
+            os.environ,
+            {"ANTIGRAVITY_PROJECT_ID": pre_tool_guard.TEXTCLUSTERS_PROJECT_ID},
+        ):
+          reason_proj = pre_tool_guard.textclusters_senior_model_denial(
+              "edit_file",
+              {"Path": shared_file},
+              "parent-conv",
+              "",
+              parent_tr,
+              art_dir,
+              [ws_dir],
+          )
+          self.assertIn("[TEXTCLUSTERS SENIOR-MODEL GUARD]", reason_proj)
+
+        # Outside TextClusters API project, non-TextClusters Blink file is not blocked by this guard
+        with patch.dict(os.environ, {"ANTIGRAVITY_PROJECT_ID": "other-proj"}):
+          self.assertEqual(
+              pre_tool_guard.textclusters_senior_model_denial(
+                  "edit_file",
+                  {"Path": shared_file},
+                  "parent-conv",
+                  "",
+                  parent_tr,
+                  art_dir,
+                  [ws_dir],
+              ),
+              "",
+          )
+      os.remove(cg_state)
+
+      # 4. Subagent invoked with Model="flash" is blocked from editing TextClusters files
+      with open(parent_tr, "w", encoding="utf-8") as f:
+        f.write(
+            json.dumps({
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [
+                    {
+                        "name": "invoke_subagent",
+                        "args": {"TypeName": "self", "Model": "flash", "Role": "Helper"},
+                    }
+                ],
+            })
+            + "\n"
+        )
+        f.write(
+            json.dumps({
+                "step_index": 1,
+                "type": "GENERIC",
+                "content": 'Created the following subagent:\n{"conversationId": "sub-flash"}',
+            })
+            + "\n"
+        )
+      sub_tr = os.path.join(tmp_dir, "art", "sub-flash", "transcript.jsonl")
+      os.makedirs(os.path.dirname(sub_tr), exist_ok=True)
+      with open(sub_tr, "w", encoding="utf-8") as f:
+        f.write("{}\n")
+      with patch.object(quota_hold, "is_orchestrator_execution_turn", return_value=False):
+        reason_sub = pre_tool_guard.textclusters_senior_model_denial(
+            "edit_file",
+            {"Path": tc_file},
+            "sub-flash",
+            "parent-conv",
+            sub_tr,
+            os.path.dirname(sub_tr),
+            [ws_dir],
+        )
+        self.assertIn("[TEXTCLUSTERS SENIOR-MODEL GUARD]", reason_sub)
+        self.assertIn('Model="flash"', reason_sub)
+
 
 if __name__ == "__main__":
   unittest.main()
