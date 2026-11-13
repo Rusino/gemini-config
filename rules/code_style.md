@@ -92,6 +92,8 @@ description: "When editing source code or tests, writing code comments, commit m
 - `[SkoreText] ` subject prefix for SkoreText CLs and CLs from the macOS `/Users/jlavrova/Sources`
   workspace (the hook checks only the project name); never on other projects' CLs or on
   companion review CLs on external authors' changes
+- Gerrit length limits (it warns on push): subject <= 50 characters including every prefix
+  (`[SkoreText] [1/6] ` counts), body lines <= 72; URLs and trailers may run longer
 - When a reviewer suggests an alternative, measure all four combinations (baseline, A, B, A+B)
   and put the numbers in the reply
 - Gerrit drafts: `scripts/gerrit_draft.py save` dedups in place by `(path, line, in_reply_to)`;
