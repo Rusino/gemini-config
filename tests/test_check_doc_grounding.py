@@ -425,6 +425,103 @@ class TestCheckDocGrounding(unittest.TestCase):
     self.assertNotIn("id\\|name", joined)
     self.assertEqual(len(warnings), 2, warnings)
 
+  # Verifies R4 CWS/Rana no-validate blocks preserve line numbers and flag unmatched markers
+  def test_no_validate_blocks_preserve_line_numbers_and_catch_unmatched(self) -> None:
+    lines = [
+        "# Header",
+        "<!-- no-validate -->",
+        "See `nonexistent/fake_inside_block.py` and [TODO] placeholder.",
+        "<!-- end-no-validate -->",
+        "See `nonexistent/after_block.py` on line 5.",
+    ]
+    masked, errors = cdg.strip_no_validate_blocks(lines)
+    self.assertEqual(errors, [])
+    self.assertEqual(len(masked), len(lines))
+    self.assertEqual(masked[2], "")
+    self.assertIn("nonexistent/after_block.py", masked[4])
+
+    # Unclosed <!-- no-validate --> is flagged and does not blank the rest of the file
+    unclosed_lines = [
+        "# Header",
+        "<!-- no-validate -->",
+        "Line 3 stays visible.",
+    ]
+    masked_u, errors_u = cdg.strip_no_validate_blocks(unclosed_lines)
+    self.assertEqual(len(errors_u), 1)
+    self.assertEqual(errors_u[0][0], 2)
+    self.assertIn("Unclosed", errors_u[0][1])
+    self.assertEqual(masked_u, unclosed_lines)
+
+    # Inline backtick mention `<!-- no-validate -->` in prose must not be treated as a directive
+    inline_lines = ["Documenting `<!-- no-validate -->` in prose without closing tag."]
+    masked_i, errors_i = cdg.strip_no_validate_blocks(inline_lines)
+    self.assertEqual(errors_i, [])
+    self.assertEqual(masked_i, inline_lines)
+
+  # Verifies R4 CommonMark backslash unescape, fenced script/Bazel target checks, and Speculoos sections
+  def test_commonmark_unescape_fenced_refs_and_speculoos_sections(self) -> None:
+    import io
+    from unittest import mock
+
+    (self.repo_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    (self.repo_dir / "scripts" / "real_tool.py").write_text("print(1)\n", encoding="utf-8")
+    (self.repo_dir / "pkg" / "sub").mkdir(parents=True, exist_ok=True)
+    (self.repo_dir / "pkg" / "sub" / "BUILD").write_text("# BUILD\n", encoding="utf-8")
+    (self.repo_dir / "docs").mkdir(parents=True, exist_ok=True)
+    (self.repo_dir / "docs" / "my_guide-v1.md").write_text("# Guide\n", encoding="utf-8")
+
+    spec_doc = self.repo_dir / "spec.md"
+    spec_doc.write_text(
+        "# Design Spec\n\n"
+        "See [external](https\\://example.com/foo/bar.py) and [guide](docs/my\\_guide\\-v1.md).\n\n"
+        "```bash\n"
+        "python3 scripts/real_tool.py\n"
+        "python3 scripts/missing_script.py\n"
+        "bash ./generic_local_example.sh\n"
+        "bash path/to/SCRIPT.sh\n"
+        "bazel test //pkg/sub:unit_tests\n"
+        "bazel test //pkg/nonexistent:unit_tests\n"
+        "bazel build //PACKAGE:TARGET\n"
+        "```\n\n"
+        "## Normative Rules\n"
+        "- The verifier MUST reject unsigned commits.\n"
+        "- Should we also reject empty descriptions?\n\n"
+        "## Future Work\n"
+        "- Add caching in Phase 2.\n"
+        "- Decide whether to use Redis or Memcached?\n\n"
+        "## Open Questions\n"
+        "- Which retry backoff curve should we use?\n"
+        "- Support multi-region replication in post-MVP Phase 2.\n",
+        encoding="utf-8",
+    )
+
+    out = io.StringIO()
+    with (
+        mock.patch.object(
+            cdg.sys,
+            "argv",
+            ["check_doc_grounding.py", "--repo", str(self.repo_dir), str(spec_doc)],
+        ),
+        mock.patch("sys.stdout", out),
+    ):
+      rc = cdg.main()
+    printed = out.getvalue()
+    self.assertEqual(rc, 1, printed)
+    # CommonMark escaped https\:// URL is not misparsed as a missing local path
+    self.assertNotIn("example.com/foo/bar.py", printed)
+    # CommonMark escaped docs/my\_guide\-v1.md resolves to docs/my_guide-v1.md
+    self.assertNotIn("my_guide-v1.md` -> Not found", printed)
+    # Fenced script/target validation catches missing repo paths while skipping placeholders & bare examples
+    self.assertIn("scripts/missing_script.py", printed)
+    self.assertIn("//pkg/nonexistent:unit_tests", printed)
+    self.assertNotIn("generic_local_example.sh", printed)
+    self.assertNotIn("SCRIPT.sh", printed)
+    self.assertNotIn("//PACKAGE:TARGET", printed)
+    # Speculoos taxonomy catches misplaced questions/milestones
+    self.assertIn("Unresolved question in normative section `Normative Rules`", printed)
+    self.assertIn("Unresolved question in `Future Work`", printed)
+    self.assertIn("Deferred milestone item in `Open Questions`", printed)
+
 
 if __name__ == "__main__":
   unittest.main()

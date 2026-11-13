@@ -26,6 +26,7 @@ SHARED_SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[3] / "scripts"
 if str(SHARED_SCRIPTS_DIR) not in sys.path:
   sys.path.insert(0, str(SHARED_SCRIPTS_DIR))
 import finding_ledger
+import stage_diff_context
 
 EXCLUDE_DIRS = {
     ".git",
@@ -1613,6 +1614,39 @@ def run_comment_audit(targets, repo_root: pathlib.Path, diff_ref=None):
     return []
 
 
+def scan_diff_doc_drift(repo_root: pathlib.Path, diff_ref: str | None) -> list[tuple[str, str]]:
+  """Checks git diff against diff_ref for stale governing-doc references (R4 Check B)."""
+  if not diff_ref:
+    return []
+  try:
+    src = stage_diff_context._load_local_source(str(repo_root), diff_ref)
+  except (OSError, ValueError):
+    return []
+  patch_text = src.get("patch_text") or ""
+  if not patch_text.strip():
+    return []
+  _, deleted_paths, _ = stage_diff_context._parse_side_b_hunk_ranges(patch_text)
+  changed_paths = [
+      pf.path
+      for pf in stage_diff_context.triage_cl.parse_patch(patch_text)
+      if pf.path != "/COMMIT_MSG" and pf.path not in deleted_paths
+  ]
+  drift = stage_diff_context.compute_governing_doc_drift(
+      repo_root,
+      changed_paths,
+      deleted_paths,
+      patch_text,
+      src.get("commit_msg") or "",
+  )
+  return [
+      (
+          f"{dc['doc_path']}:L{dc['doc_line']}",
+          f"[DOC_DRIFT:{dc['kind']}] `{dc['token']}` removed in `{dc['source_file']}`",
+      )
+      for dc in (drift.get("drift_candidates") or [])
+  ]
+
+
 def format_markdown_report(report):
   out = []
   summary = report["summary"]
@@ -1713,6 +1747,10 @@ def format_markdown_report(report):
           "stub_cpp_files",
           "Private `src/` Stub `.cpp` Files Belonging In-Class in `.h` (`[STUB_CPP]`)",
       ),
+      (
+          "doc_code_drift",
+          "Stale Governing Doc References After Code Diff (`[DOC_DRIFT]`, R4)",
+      ),
   ]
   for key, title in labels:
     items = horrors.get(key, [])
@@ -1803,6 +1841,10 @@ def main():
       file_records, max_func_lines=args.max_func_lines, max_file_lines=args.max_file_lines
   )
   horrors = scan_horrors_and_invariants(file_records, allow_cyrillic=args.allow_cyrillic)
+  if args.diff:
+    doc_drift_hits = scan_diff_doc_drift(repo_root, args.diff)
+    if doc_drift_hits:
+      horrors["doc_code_drift"].extend(doc_drift_hits)
   comment_Targets = [r[0] for r in file_records] if not args.diff else args.paths
   comment_issues = run_comment_audit(comment_Targets, repo_root, diff_ref=args.diff)
 

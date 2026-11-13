@@ -2,10 +2,10 @@
 name: amnesia-precommit
 description: >-
   Token-efficient pre-commit audit and diff minimizer for Skia, SkParagraph, WebParagraph, and
-  Flutter changes (deterministic comment/code checks, clean-context Hunter + keeper_skeptic
-  refutation, finding_ledger caching, single-rebuild TDD verification, and per-repo corpus/perf
-  gates). Trigger before committing/uploading or when the user asks to "подготовь к коммиту",
-  "минимизируй дифф", "проверь перед пушем", "сделай амнезия-ревью", or "run amnesia precommit".
+  Flutter changes (comment/code checks, Hunter + keeper_skeptic refutation, finding_ledger,
+  single-rebuild TDD, and corpus/perf gates). Trigger before committing/uploading or when asked to
+  "подготовь к коммиту", "минимизируй дифф", "проверь перед пушем", "сделай амнезия-ревью", or
+  "run amnesia precommit".
 ---
 
 # Amnesia Pre-Commit & Diff Minimizer (`amnesia-precommit`)
@@ -42,7 +42,7 @@ Execute a strict pre-commit audit and diff minimization workflow before uploadin
    - Strip leftover debug prints, anonymous `TODO`s without `KEEPER-DEBT`, and uncalled helpers.
    - Format modified lines only: `git clang-format` (or `dart format` for Dart files).
 
-4. **Stage 0 Parallel Context Bundle**: After mechanical fixes settle, pre-stage the commit message, `finding_ledger.py` refutations, optional `transcript.jsonl` user constraints, unified `diff.patch`, and 1-indexed post-patch `Side B` files + companion `.h` headers in one pass so Stage A Hunter shards read them in a single parallel Turn 1 `read_file` batch:
+4. **Stage 0 Parallel Context Bundle & Governing Doc <-> Code Drift (`R4`)**: After mechanical fixes settle, pre-stage the commit message, `finding_ledger.py` refutations, nearest governing docs + `Doc <-> Code Drift` candidates (`AGENTS.md`, `SKILL.md`, `README.md`, `CLIENT_GUIDE.md`, `ARCHITECT_GUIDE.md`, `g3doc/*.md`; skipped when `NO_DOC_SYNC=<reason>` is in the commit description), optional `transcript.jsonl` user constraints, unified `diff.patch`, and 1-indexed post-patch `Side B` files + companion `.h` headers in one pass so Stage A Hunter shards read them in a single parallel Turn 1 `read_file` batch:
    ```bash
    python3 ~/.gemini/config/scripts/stage_diff_context.py \
      --repo . --diff HEAD \

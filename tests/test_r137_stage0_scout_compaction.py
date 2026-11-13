@@ -375,6 +375,98 @@ class TestR137Stage0ScoutCompaction(unittest.TestCase):
       self.assertIn("COMPACTION: NO", txt, f"Missing COMPACTION: NO in {path}")
       self.assertIn("<CONTEXT_SUMMARY>", txt, f"Missing <CONTEXT_SUMMARY> in {path}")
 
+  # Verifies R4 Part (3) walk-up governing doc discovery, directive extraction (Check A),
+  # stale symbol/flag/path drift detection (Check B), private-helper filtering, and NO_DOC_SYNC
+  def test_governing_doc_drift_discovery_directives_and_no_doc_sync(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      repo = Path(tmp) / "repo"
+      repo.mkdir()
+      self._git(repo, "init", "-b", "main")
+      self._git(repo, "config", "user.email", "test@example.com")
+      self._git(repo, "config", "user.name", "Tester")
+
+      (repo / "AGENTS.md").write_text(
+          "# Root Rules\n- NEVER bypass pre-commit checks.\n", encoding="utf-8"
+      )
+      mod_dir = repo / "skills" / "demo"
+      mod_dir.mkdir(parents=True)
+      (mod_dir / "SKILL.md").write_text(
+          "# Demo Skill\n"
+          "MUST validate inputs before running.\n"
+          "Invoke `run_legacy_check` with `--legacy-flag` or `skills/demo/old_helper.py`.\n"
+          "<!-- no-validate -->\n"
+          "Ignored stale `run_legacy_check` and `--legacy-flag` block.\n"
+          "<!-- /no-validate -->\n",
+          encoding="utf-8",
+      )
+      (mod_dir / "runner.py").write_text(
+          "def _private_helper():\n"
+          "  return 1\n\n"
+          "def run_legacy_check():\n"
+          "  return '--legacy-flag'\n",
+          encoding="utf-8",
+      )
+      (mod_dir / "old_helper.py").write_text("x = 1\n", encoding="utf-8")
+      self._git(repo, "add", ".")
+      self._git(repo, "commit", "-m", "Initial baseline")
+
+      # Rename run_legacy_check -> run_modern_check, drop --legacy-flag, drop _private_helper,
+      # and delete old_helper.py without updating SKILL.md
+      (mod_dir / "runner.py").write_text(
+          "def _new_private_helper():\n"
+          "  return 2\n\n"
+          "def run_modern_check():\n"
+          "  return '--modern-flag'\n",
+          encoding="utf-8",
+      )
+      (mod_dir / "old_helper.py").unlink()
+
+      out_dir = Path(tmp) / "stage0"
+      with patch.dict(os.environ, {"JETSKI_LEDGER_DIR": str(Path(tmp) / "ledgers")}):
+        summary = stage_diff_context.stage_context(
+            out_dir=out_dir, repo=str(repo), diff_ref="HEAD"
+        )
+
+      gov_paths = [g["doc_path"] for g in summary["governing_docs"]]
+      self.assertIn("skills/demo/SKILL.md", gov_paths)
+      self.assertIn("AGENTS.md", gov_paths)
+      skill_gov = next(
+          g for g in summary["governing_docs"] if g["doc_path"] == "skills/demo/SKILL.md"
+      )
+      self.assertFalse(skill_gov["co_updated"])
+      self.assertTrue(any("MUST validate inputs" in d for d in skill_gov["directives"]))
+
+      drifts = summary["doc_code_drift"]
+      drift_tokens = {(d["kind"], d["token"], d["doc_line"]) for d in drifts}
+      self.assertIn(("deleted_path", "skills/demo/old_helper.py", 3), drift_tokens)
+      self.assertIn(("removed_cli_flag", "--legacy-flag", 3), drift_tokens)
+      self.assertIn(("removed_or_renamed_symbol", "run_legacy_check", 3), drift_tokens)
+      # Private helper and <!-- no-validate --> lines must never be flagged
+      self.assertFalse(any(d["token"] == "_private_helper" for d in drifts))
+      self.assertFalse(any(d["doc_line"] == 5 for d in drifts))
+
+      ctx_md = (out_dir / "context.md").read_text(encoding="utf-8")
+      self.assertIn("Governing Docs & Doc <-> Code Drift Check (R4)", ctx_md)
+      self.assertIn("[DRIFT `removed_cli_flag`]", ctx_md)
+
+      # Verify NO_DOC_SYNC=<reason> suppresses drift candidates
+      self._git(repo, "add", "-A")
+      self._git(
+          repo,
+          "commit",
+          "-m",
+          "Migrate runner\n\nNO_DOC_SYNC=doc update staged in follow-up CL",
+      )
+      out_skip = Path(tmp) / "stage0_skip"
+      with patch.dict(os.environ, {"JETSKI_LEDGER_DIR": str(Path(tmp) / "ledgers")}):
+        skip_sum = stage_diff_context.stage_context(
+            out_dir=out_skip, repo=str(repo), diff_ref="HEAD~1..HEAD"
+        )
+      self.assertEqual(
+          skip_sum["no_doc_sync_reason"], "doc update staged in follow-up CL"
+      )
+      self.assertEqual(skip_sum["doc_code_drift"], [])
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -752,6 +752,44 @@ class TestRuthlessCodeAudit(unittest.TestCase):
     )
     self.assertEqual(lint_proc.returncode, 0, msg=lint_proc.stdout + lint_proc.stderr)
 
+  # Verifies R4 Part (3) scan_diff_doc_drift in ruthless_audit.py --diff mode
+  def test_scan_diff_doc_drift_flags_stale_governing_doc_refs(self):
+    for args in (
+        ("init", "-b", "main"),
+        ("config", "user.email", "t@example.com"),
+        ("config", "user.name", "Tester"),
+    ):
+      subprocess.run(
+          ["git", "-C", str(self.root), *args],
+          check=True,
+          capture_output=True,
+      )
+    self._write(
+        "pkg/README.md",
+        "# Package Guide\nCall `compute_legacy_metric` with `--old-threshold`.\n",
+    )
+    self._write(
+        "pkg/metric.py",
+        "def compute_legacy_metric():\n  return '--old-threshold'\n",
+    )
+    subprocess.run(["git", "-C", str(self.root), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(self.root), "commit", "-m", "Init"],
+        check=True,
+        capture_output=True,
+    )
+    self._write(
+        "pkg/metric.py",
+        "def compute_modern_metric():\n  return '--new-threshold'\n",
+    )
+    hits = ruthless_audit.scan_diff_doc_drift(self.root, "HEAD")
+    joined = " | ".join(f"{loc}:{msg}" for loc, msg in hits)
+    self.assertIn("pkg/README.md:L2:[DOC_DRIFT:removed_cli_flag] `--old-threshold`", joined)
+    self.assertIn(
+        "pkg/README.md:L2:[DOC_DRIFT:removed_or_renamed_symbol] `compute_legacy_metric`",
+        joined,
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -93,6 +93,43 @@ RETIRED_SKILL_RE = re.compile(
     r"\bNEVER\b[^\n]*?\bfollow the\s+`([a-z0-9_-]+)`\s+skill\b", re.I
 )
 ANCHOR_LINK_RE = re.compile(r"\[[^\]]+\]\(#([a-zA-Z0-9_-]+)\)")
+MD_LINK_TARGET_RE = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)")
+COMMONMARK_BACKSLASH_ESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
+NO_VALIDATE_OPEN_RE = re.compile(r"<!--\s*no-validate\s*-->", re.I)
+NO_VALIDATE_CLOSE_RE = re.compile(r"<!--\s*(?:end-no-validate|/no-validate)\s*-->", re.I)
+FENCED_SCRIPT_CMD_RE = re.compile(
+    r"(?:^|[;&|]\s*|\b(?:sudo|env|nohup|time)\s+)"
+    r"(?:bash|sh|zsh|python3?|node|ruby|perl)\s+"
+    r"(?:-[A-Za-z0-9_-]+\s+)*"
+    r"([^\s;&|\"'`<>()]+?\.(?:sh|bash|zsh|py|js|mjs|cjs|ts|rb|pl))\b"
+)
+FENCED_BAZEL_TARGET_RE = re.compile(
+    r"(?:(?<![:\w/\"'])(//[a-zA-Z0-9_][\w./-]*:[a-zA-Z0-9_][\w.+=-]*)"
+    r"|\b(?:bazel|blaze)\s+(?:build|test|run|query|cquery|aquery)\s+(?:-[^\s]+\s+)*"
+    r"(//[a-zA-Z0-9_][\w./-]*(?::[a-zA-Z0-9_][\w.+=-]*)?))"
+)
+FUTURE_WORK_HEADING_RE = re.compile(
+    r"^(?:\d+(?:\.\d+)*[\.\):]?\s*)?Future\s+Work\b", re.I
+)
+OPEN_QUESTIONS_HEADING_RE = re.compile(
+    r"^(?:\d+(?:\.\d+)*[\.\):]?\s*)?Open\s+Questions?\b", re.I
+)
+NORMATIVE_HEADING_RE = re.compile(
+    r"^(?:\d+(?:\.\d+)*[\.\):]?\s*)?(?:Normative\s+(?:Rules|Requirements|Specification)|Requirements)\b",
+    re.I,
+)
+UNRESOLVED_QUESTION_RE = re.compile(
+    r"\b(?:TBD|open\s+questions?|whether\s+to|undecided|need\s+to\s+decide|to\s+be\s+decided)\b",
+    re.I,
+)
+DEFERRED_MILESTONE_RE = re.compile(
+    r"\b(?:post-MVP|phase\s+[2-9]|future\s+release|will\s+later|deferred\s+to|sequenced\s+for\s+later)\b",
+    re.I,
+)
+QUESTION_STARTER_RE = re.compile(
+    r"\b(?:whether|should|how|which|what|who|when|where|why|open\s+questions?)\b",
+    re.I,
+)
 
 # Jetski read_file per-call ceiling is 800 lines / 46,080 bytes; own skills keep tighter budgets
 SKILL_SOFT_MAX_LINES = 400
@@ -185,6 +222,182 @@ def load_text(path_str: str) -> str:
 
 def clean_google_docs_escapes(text: str) -> str:
     return text.replace(r"\_", "_").replace(r"\[", "[").replace(r"\]", "]")
+
+
+def unescape_commonmark(text: str) -> str:
+    """Unescapes CommonMark backslash-escaped ASCII punctuation in link targets and paths."""
+    return COMMONMARK_BACKSLASH_ESCAPE_RE.sub(r"\1", text)
+
+
+def strip_no_validate_blocks(
+    lines: list[str],
+) -> tuple[list[str], list[tuple[int, str, str]]]:
+    """Masks <!-- no-validate -->...<!-- end-no-validate --> blocks while preserving line numbers."""
+    masked: list[str] = []
+    errors: list[tuple[int, str, str]] = []
+    open_line: int | None = None
+
+    for idx, line in enumerate(lines, start=1):
+        # Ignore inline code spans so prose mentions like `<!-- no-validate -->` do not trigger
+        line_no_inline = re.sub(r"`[^`\n]+`", lambda m: " " * len(m.group(0)), line)
+        has_open = NO_VALIDATE_OPEN_RE.search(line_no_inline)
+        has_close = NO_VALIDATE_CLOSE_RE.search(line_no_inline)
+
+        if has_open and has_close and has_open.start() < has_close.start():
+            if open_line is not None:
+                errors.append((
+                    idx,
+                    "Nested or duplicate <!-- no-validate --> marker",
+                    has_open.group(0),
+                ))
+            prefix = line[: has_open.start()]
+            suffix = line[has_close.end() :]
+            masked.append(prefix + " " * (has_close.end() - has_open.start()) + suffix)
+            continue
+
+        if has_open:
+            if open_line is not None:
+                errors.append((
+                    idx,
+                    "Unclosed <!-- no-validate --> marker before nested marker",
+                    has_open.group(0),
+                ))
+            open_line = idx
+            masked.append(line[: has_open.start()])
+            continue
+
+        if has_close:
+            if open_line is None:
+                errors.append((
+                    idx,
+                    "Unmatched <!-- end-no-validate --> marker without opening <!-- no-validate -->",
+                    has_close.group(0),
+                ))
+                masked.append(line)
+            else:
+                open_line = None
+                masked.append(line[has_close.end() :])
+            continue
+
+        masked.append("" if open_line is not None else line)
+
+    if open_line is not None:
+        errors.append((
+            open_line,
+            "Unclosed <!-- no-validate --> marker (missing <!-- end-no-validate -->)",
+            "<!-- no-validate -->",
+        ))
+        # Restore lines after unclosed marker so rest of document is not silently blanked
+        return list(lines), errors
+
+    return masked, errors
+
+
+def _is_placeholder_code_ref(token: str) -> bool:
+    """Returns True for placeholder script/target tokens (ALL_CAPS, <...>, $VAR, path/to)."""
+    if any(ch in token for ch in ("<", ">", "$", "*", "{", "}")):
+        return True
+    if "..." in token:
+        return True
+    low = token.lower().lstrip("/")
+    if "path/to" in low or low.startswith(("example/", "package:", "pkg:", "foo/bar")):
+        return True
+    if low.startswith(("tmp/", "var/", "dev/", "proc/", "usr/bin/", "bin/")):
+        return True
+    # Check if stem or target name is an ALL_CAPS placeholder like SCRIPT.sh or //PACKAGE:TARGET
+    cleaned = token.lstrip("./")
+    parts = [p for seg in cleaned.split("/") for p in seg.split(":") if p]
+    for part in parts:
+        stem = os.path.splitext(part)[0]
+        if len(stem) >= 2 and stem.isupper() and re.search(r"[A-Z]", stem):
+            return True
+    return False
+
+
+def _is_bare_or_dot_rel_script(token: str) -> bool:
+    """Returns True when token is a bare filename or ./ / ../ relative filename with no subdir."""
+    t = token.strip()
+    while t.startswith(("./", "../")):
+        t = t[3:] if t.startswith("../") else t[2:]
+    return "/" not in t
+
+
+def check_spec_section_taxonomy(lines: list[str]) -> list[str]:
+    """Checks Speculoos boundaries between Future Work, Open Questions, and Normative sections."""
+    warnings: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    section_kind = ""
+    section_title = ""
+
+    for idx, line in enumerate(lines, start=1):
+        m_fence = FENCE_OPEN_RE.match(line)
+        if m_fence:
+            ticks, info = m_fence.group(1), m_fence.group(2).strip()
+            if not in_fence:
+                in_fence = True
+                fence_marker = ticks
+                continue
+            if ticks[0] == fence_marker[0] and len(ticks) >= len(fence_marker) and not info:
+                in_fence = False
+                fence_marker = ""
+                continue
+        if in_fence:
+            continue
+
+        hm = HEADING_RE.match(line)
+        if hm:
+            raw_title = re.sub(r"[*`_~]", "", hm.group(1)).strip()
+            if FUTURE_WORK_HEADING_RE.match(raw_title):
+                section_kind = "future_work"
+                section_title = raw_title
+            elif OPEN_QUESTIONS_HEADING_RE.match(raw_title):
+                section_kind = "open_questions"
+                section_title = raw_title
+            elif NORMATIVE_HEADING_RE.match(raw_title):
+                section_kind = "normative"
+                section_title = raw_title
+            else:
+                section_kind = ""
+                section_title = ""
+            continue
+
+        if not section_kind or not line.strip():
+            continue
+
+        # Strip inline code, URLs, and quoted strings before scanning prose intent
+        prose = re.sub(r"`[^`\n]+`", " ", line)
+        prose = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", prose)
+        prose_unquoted = re.sub(r'"[^"\n]*"|\'[^\'\n]*\'', " ", prose).strip()
+        if not prose_unquoted:
+            continue
+
+        if section_kind == "future_work":
+            if prose_unquoted.endswith("?") or UNRESOLVED_QUESTION_RE.search(prose_unquoted):
+                warnings.append(
+                    f"Line {idx}: Unresolved question in `{section_title}` "
+                    "(move unresolved decisions to `Open Questions`; `Future Work` is for "
+                    f"resolved post-MVP designs): {line.strip()[:90]!r}"
+                )
+        elif section_kind == "open_questions":
+            if (
+                DEFERRED_MILESTONE_RE.search(prose_unquoted)
+                and "?" not in prose_unquoted
+                and not QUESTION_STARTER_RE.search(prose_unquoted)
+            ):
+                warnings.append(
+                    f"Line {idx}: Deferred milestone item in `{section_title}` "
+                    "(move resolved post-MVP work to `Future Work`; `Open Questions` is for "
+                    f"unresolved decisions): {line.strip()[:90]!r}"
+                )
+        elif section_kind == "normative":
+            if prose_unquoted.endswith("?") or UNRESOLVED_QUESTION_RE.search(prose_unquoted):
+                warnings.append(
+                    f"Line {idx}: Unresolved question in normative section `{section_title}` "
+                    f"(move to `Open Questions`): {line.strip()[:90]!r}"
+                )
+
+    return warnings
 
 
 def index_repo_files(
@@ -281,9 +494,11 @@ def looks_like_path(token: str) -> bool:
 
 
 def normalize_candidate_path(token: str) -> str:
-    cleaned = token.strip().rstrip(".,:;)")
+    cleaned = unescape_commonmark(token.strip()).rstrip(".,:;)")
+    if cleaned.startswith(("http://", "https://", "mailto:", "conversation://", "#")):
+        return ""
     cleaned = re.sub(r"^github\.com/[^/]+/[^/]+/(?:blob|tree)/[^/]+/", "", cleaned)
-    cleaned = re.sub(r"(?::\d+(?:-\d+)?|#L\d+(?:-L?\d+)?)$", "", cleaned)
+    cleaned = re.sub(r"(?::\d+(?:-\d+)?|#L\d+(?:-L?\d+)?|#[A-Za-z0-9_.-]+)$", "", cleaned)
     cleaned = re.sub(r"/\.\.\.$", "", cleaned)
     cleaned = re.sub(r"/\*[^/]*$", "", cleaned)
     if cleaned.endswith("-"):
@@ -328,8 +543,13 @@ def path_exists_anywhere(
             return True
     if cand.startswith("//"):
         bazel_rel = cand.lstrip("/").split(":")[0]
+        if bazel_rel.startswith("depot/google3/"):
+            g3_sub = bazel_rel[len("depot/") :]
+            if (Path("/google/src/files/head/depot") / g3_sub).exists():
+                return True
         if bazel_rel in repo_rel_set or any((r / bazel_rel).exists() for r in repos):
             return True
+        return False
     rel = strip_leading_curdir(cand)
     if rel in repo_rel_set:
         return True
@@ -887,7 +1107,8 @@ def main() -> int:
     for file_arg in args.files:
         raw_text = load_text(file_arg)
         text = clean_google_docs_escapes(raw_text)
-        lines = text.splitlines()
+        raw_lines = text.splitlines()
+        lines, no_validate_errors = strip_no_validate_blocks(raw_lines)
 
         print(f"=== Grounding Audit: {file_arg} ===")
         if repos:
@@ -910,7 +1131,7 @@ def main() -> int:
             except Exception:
                 pass
 
-        placeholders: list[tuple[int, str, str]] = []
+        placeholders: list[tuple[int, str, str]] = list(no_validate_errors)
         is_internal_config_repo = any(".gemini" in r.parts for r in repos)
         in_fence = False
         for idx, line in enumerate(lines, start=1):
@@ -945,7 +1166,7 @@ def main() -> int:
         verified_paths: list[str] = []
 
         heading_slugs: set[str] = set()
-        for line in lines:
+        for line in raw_lines:
             hm = HEADING_RE.match(line)
             if hm:
                 heading_slugs.add(slugify_heading(hm.group(1)))
@@ -957,40 +1178,82 @@ def main() -> int:
                 if heading_slugs and anchor not in heading_slugs:
                     broken_anchors.append((idx, am.group(1)))
 
+        spec_taxonomy_warnings = check_spec_section_taxonomy(lines)
+
+        in_fence_scan = False
+        fence_marker_scan = ""
         for idx, line in enumerate(lines, start=1):
-            # Ignore URLs, file:// links, and backtick spans before scanning bare paths
+            m_fence = FENCE_OPEN_RE.match(line)
+            if m_fence:
+                ticks, info = m_fence.group(1), m_fence.group(2).strip()
+                if not in_fence_scan:
+                    in_fence_scan = True
+                    fence_marker_scan = ticks
+                    continue
+                if (
+                    ticks[0] == fence_marker_scan[0]
+                    and len(ticks) >= len(fence_marker_scan)
+                    and not info
+                ):
+                    in_fence_scan = False
+                    fence_marker_scan = ""
+                    continue
+
+            # Ignore URLs (including CommonMark https\://), file:// links, and backtick spans
             line_no_urls = re.sub(
-                r"(?:https?|file)://\S+|`[^`\n]*`|\$(?:\{[^}\s]+\}|[A-Za-z_]\w*)(?:/[^\s`'\")]+)*",
+                r"(?:https?|file)\\?://\S+|`[^`\n]*`|\$(?:\{[^}\s]+\}|[A-Za-z_]\w*)(?:/[^\s`'\")]+)*",
                 " ",
                 line,
             )
-            candidates: list[str] = []
+            candidates: list[tuple[str, bool]] = []
+            if in_fence_scan:
+                for m_scr in FENCED_SCRIPT_CMD_RE.finditer(line):
+                    tok = m_scr.group(1).strip()
+                    if not _is_placeholder_code_ref(tok):
+                        candidates.append((tok, True))
+                for m_bzl in FENCED_BAZEL_TARGET_RE.finditer(line):
+                    tok = (m_bzl.group(1) or m_bzl.group(2) or "").strip()
+                    if tok and not _is_placeholder_code_ref(tok):
+                        candidates.append((tok, False))
+            else:
+                for m_link in MD_LINK_TARGET_RE.finditer(line):
+                    raw_target = unescape_commonmark(m_link.group(1).strip())
+                    if raw_target.startswith("file://"):
+                        continue
+                    if looks_like_path(raw_target):
+                        candidates.append((raw_target, False))
             for m in FILE_LINK_RE.finditer(line):
-                candidates.append(m.group(1))
+                candidates.append((m.group(1), False))
             for m in PATH_TOKEN_RE.finditer(line):
-                tok = m.group(1).strip()
+                tok = unescape_commonmark(m.group(1).strip())
                 if looks_like_path(tok):
-                    candidates.append(tok)
+                    candidates.append((tok, in_fence_scan))
             for m in BARE_PATH_RE.finditer(line_no_urls):
-                tok = m.group(1).strip()
+                tok = unescape_commonmark(m.group(1).strip())
                 if looks_like_path(tok):
-                    candidates.append(tok)
+                    candidates.append((tok, in_fence_scan))
 
-            for raw_cand in candidates:
+            for raw_cand, from_fence in candidates:
                 cand = normalize_candidate_path(raw_cand)
                 if not cand or cand in seen_paths:
                     continue
                 if any(ch in cand for ch in ("<", ">", "$", "*", "{", "}")):
                     continue
+                if from_fence and _is_placeholder_code_ref(cand):
+                    continue
+                exists = path_exists_anywhere(cand, repos, repo_rel_set, by_basename, doc_dirs)
+                # In fenced code blocks, skip bare or ./ / ../ example script names with no repo hit
+                if from_fence and not exists and _is_bare_or_dot_rel_script(raw_cand):
+                    continue
                 seen_paths.add(cand)
-                if "/" in cand:
+                if "/" in cand and not cand.startswith("//"):
                     base = os.path.basename(cand)
                     if base and base not in ("SKILL.md", "AGENTS.md", "GEMINI.md", "README.md"):
                         doc_paths_by_base.setdefault(base, []).append((idx, cand))
-                if path_exists_anywhere(cand, repos, repo_rel_set, by_basename, doc_dirs):
+                if exists:
                     verified_paths.append(cand)
                 else:
-                    base = os.path.basename(cand)
+                    base = os.path.basename(cand.split(":")[0])
                     suggestions = by_basename.get(base, [])[:4] if base else []
                     missing_paths.append((idx, raw_cand, suggestions))
 
@@ -1048,14 +1311,20 @@ def main() -> int:
         else:
             print("  None")
 
-        intra_count = len(intra_doc_path_conflicts) + len(broken_anchors)
+        intra_count = (
+            len(intra_doc_path_conflicts)
+            + len(broken_anchors)
+            + len(spec_taxonomy_warnings)
+        )
         print(f"\n[2] Intra-Document Consistency Warnings ({intra_count}):")
-        if intra_doc_path_conflicts or broken_anchors:
+        if intra_doc_path_conflicts or broken_anchors or spec_taxonomy_warnings:
             for base, entries in intra_doc_path_conflicts:
                 locs = ", ".join(f"`{c}` (L{ln})" for ln, c in entries)
                 print(f"  - Multiple distinct paths for `{base}` within the same doc: {locs}")
             for line_no, anchor in broken_anchors:
                 print(f"  - Line {line_no}: Broken internal heading anchor `#{anchor}`")
+            for w in spec_taxonomy_warnings:
+                print(f"  - {w}")
             total_issues += intra_count
         else:
             print("  None")

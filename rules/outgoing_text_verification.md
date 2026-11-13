@@ -32,6 +32,12 @@ description: "Zero-trust verification of incoming and outgoing documents and cod
   `verify_test_liveness.py`; the `TEST-LIVENESS` hook blocks upload until they pass); never
   present a post-fix-only run as proof the bug is fixed unless it failed before the fix, and say
   explicitly when an auxiliary fuzzer or corpus run only checks the new code for regressions
+- Source of truth (code vs. docs): executable code and active configs (`infra/`, `BUILD`, CI/CQ
+  verifiers) win over `.md` docs for what a system actually does (`what is`); header/API contracts
+  and tests define required behavior (`what should be`). When code and docs disagree, name both
+  values with exact `file:line` (`stale doc` vs `code bug`)
 
-Never: paraphrase identifiers; claim how a parser, build or runtime works without `file:line`;
-leave placeholders (`TBD`, `TODO`, `[insert ...]`, empty links) in delivered text.
+Never: paraphrase identifiers; claim how a parser, build, CI/CQ or runtime works without
+`file:line`; make a negative claim ("project has no X check") from docs or one file (e.g.
+`PRESUBMIT.py`) without a repo-wide search (`git grep -i`, including `infra/`); leave placeholders
+(`TBD`, `TODO`, `[insert ...]`, empty links) in delivered text.

@@ -66,6 +66,37 @@ DOC_EXTENSIONS = frozenset({".md", ".rst", ".txt", ".adoc", ".html"})
 TEST_BASENAME_RE = re.compile(
     r"^(?:test_.*|.*(?:_test|_tests|_unittest|Test|Tests|\.spec|\.test)\.[A-Za-z0-9]+)$"
 )
+GOVERNING_DOC_NAMES = (
+    "AGENTS.md",
+    "SKILL.md",
+    "README.md",
+    "CLIENT_GUIDE.md",
+    "ARCHITECT_GUIDE.md",
+)
+NO_DOC_SYNC_RE = re.compile(r"(?m)^\s*NO_DOC_SYNC\s*=\s*(.+?)\s*$")
+NO_VALIDATE_SPAN_RE = re.compile(
+    r"<!--\s*no-validate\s*-->[\s\S]*?<!--\s*(?:end-no-validate|/no-validate)\s*-->",
+    re.IGNORECASE,
+)
+DOC_DIRECTIVE_RE = re.compile(
+    r"\b(?:DO\s+NOT|DON'T|MUST\s+NOT|MUST|NEVER|ALWAYS|CRITICAL|IMPORTANT)\b"
+)
+CLI_FLAG_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(--[A-Za-z0-9][A-Za-z0-9_-]{2,})\b")
+DECL_SYMBOL_RES = (
+    re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z][A-Za-z0-9_]{3,})\s*\("),
+    re.compile(
+        r"^\s*(?:export\s+)?(?:abstract\s+)?(?:class|struct|enum(?:\s+class)?|"
+        r"interface|mixin|extension|function)\s+([A-Za-z][A-Za-z0-9_]{2,})\b"
+    ),
+    re.compile(
+        r"^\s*(?:virtual\s+|static\s+|inline\s+|constexpr\s+)*"
+        r"[A-Za-z_][\w:<>,\s*&]+\s+([A-Za-z][A-Za-z0-9_]{3,})\s*\("
+    ),
+)
+_NON_SYMBOL_WORDS = frozenset({
+    "return", "switch", "while", "sizeof", "delete", "if", "for",
+    "catch", "elif", "assert", "print", "super", "typeof", "main",
+})
 
 
 def _run_git(cwd: Path, args: list[str], timeout: float = 10.0) -> tuple[int, str]:
@@ -296,6 +327,201 @@ def _compute_comodified_siblings(
       }
       for cand, count in ranked
   ]
+
+
+def _extract_removed_diff_tokens(
+    repo_root: Path | None, patch_text: str
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+  """Extracts public symbols and CLI flags removed in patch_text and absent on disk."""
+  rem_flags: dict[str, set[str]] = {}
+  add_flags: dict[str, set[str]] = {}
+  rem_syms: dict[str, set[str]] = {}
+  add_syms: dict[str, set[str]] = {}
+  cur_path: str | None = None
+
+  for raw in patch_text.splitlines():
+    m_git = re.match(r"^diff --git a/(.*?) b/(.*)$", raw)
+    if m_git:
+      cand = m_git.group(2).strip()
+      cur_path = None if _is_excluded_comod_path(cand) else cand
+      continue
+    if not cur_path or raw.startswith(("+++ ", "--- ", "@@ ")):
+      continue
+    if raw.startswith("-"):
+      body = raw[1:]
+      for fl in CLI_FLAG_TOKEN_RE.findall(body):
+        rem_flags.setdefault(cur_path, set()).add(fl)
+      for rx in DECL_SYMBOL_RES:
+        m = rx.match(body)
+        if m and m.group(1) not in _NON_SYMBOL_WORDS and not m.group(1).startswith("_"):
+          rem_syms.setdefault(cur_path, set()).add(m.group(1))
+    elif raw.startswith("+"):
+      body = raw[1:]
+      for fl in CLI_FLAG_TOKEN_RE.findall(body):
+        add_flags.setdefault(cur_path, set()).add(fl)
+      for rx in DECL_SYMBOL_RES:
+        m = rx.match(body)
+        if m and m.group(1) not in _NON_SYMBOL_WORDS and not m.group(1).startswith("_"):
+          add_syms.setdefault(cur_path, set()).add(m.group(1))
+
+  out_flags: dict[str, set[str]] = {}
+  out_syms: dict[str, set[str]] = {}
+  for src_file in sorted(set(rem_flags) | set(rem_syms)):
+    post_text = ""
+    if repo_root is not None and (repo_root / src_file).is_file():
+      try:
+        post_text = (repo_root / src_file).read_text(encoding="utf-8", errors="replace")
+      except OSError:
+        post_text = ""
+    gone_flags = {
+        fl
+        for fl in (rem_flags.get(src_file, set()) - add_flags.get(src_file, set()))
+        if not post_text or fl not in post_text
+    }
+    if gone_flags:
+      out_flags[src_file] = gone_flags
+    gone_syms = {
+        sym
+        for sym in (rem_syms.get(src_file, set()) - add_syms.get(src_file, set()))
+        if not post_text or not re.search(rf"\b{re.escape(sym)}\b", post_text)
+    }
+    if gone_syms:
+      out_syms[src_file] = gone_syms
+  return out_flags, out_syms
+
+
+def compute_governing_doc_drift(
+    repo_root: Path | None,
+    changed_paths: list[str],
+    deleted_paths: set[str],
+    patch_text: str,
+    commit_msg: str = "",
+    max_docs: int = 8,
+) -> dict:
+  """Discovers nearest governing docs for modified files and detects Doc <-> Code drift.
+
+  Walks up from each modified/deleted path to find nearest governing docs
+  (AGENTS.md, SKILL.md, README.md, CLIENT_GUIDE.md, ARCHITECT_GUIDE.md, g3doc/*.md),
+  extracts explicit operational directives (DO/DON'T/MUST/NEVER/CRITICAL/IMPORTANT)
+  for Check A, and detects stale references to deleted files, removed CLI flags,
+  or renamed/removed public symbols for Check B unless NO_DOC_SYNC=<reason> is set.
+  """
+  m_skip = NO_DOC_SYNC_RE.search(commit_msg or "")
+  if m_skip:
+    reason = m_skip.group(1).strip()
+    if reason and reason.upper() not in ("TODO", "TBD", "NONE"):
+      return {
+          "no_doc_sync_reason": reason,
+          "governing_docs": [],
+          "drift_candidates": [],
+      }
+
+  if repo_root is None:
+    return {"no_doc_sync_reason": "", "governing_docs": [], "drift_candidates": []}
+
+  repo_root = repo_root.resolve()
+  all_touched = [
+      p
+      for p in sorted(set(changed_paths) | set(deleted_paths))
+      if Path(p).suffix.lower() not in DOC_EXTENSIONS
+  ]
+  if not all_touched:
+    return {"no_doc_sync_reason": "", "governing_docs": [], "drift_candidates": []}
+
+  doc_to_files: dict[str, set[str]] = {}
+  for rel_path in all_touched:
+    cur_dir = (repo_root / rel_path).parent
+    found_in_ancestors = 0
+    while True:
+      if not cur_dir.is_relative_to(repo_root):
+        break
+      dir_docs: list[Path] = []
+      for dname in GOVERNING_DOC_NAMES:
+        cand = cur_dir / dname
+        if cand.is_file():
+          dir_docs.append(cand)
+      g3doc_dir = cur_dir / "g3doc"
+      if g3doc_dir.is_dir():
+        dir_docs.extend(sorted(g3doc_dir.glob("*.md"))[:3])
+      if dir_docs:
+        for doc_p in dir_docs:
+          doc_rel = doc_p.resolve().relative_to(repo_root).as_posix()
+          doc_to_files.setdefault(doc_rel, set()).add(rel_path)
+        found_in_ancestors += 1
+        if found_in_ancestors >= 2:
+          break
+      if cur_dir == repo_root:
+        break
+      cur_dir = cur_dir.parent
+
+  changed_set = set(changed_paths)
+  removed_flags, removed_syms = _extract_removed_diff_tokens(repo_root, patch_text)
+  governing_docs: list[dict] = []
+  drift_candidates: list[dict] = []
+
+  for doc_rel in sorted(doc_to_files)[:max_docs]:
+    doc_full = repo_root / doc_rel
+    try:
+      raw_doc = doc_full.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+      continue
+    # Mask <!-- no-validate --> spans with line-preserving spaces before scanning
+    masked_doc = NO_VALIDATE_SPAN_RE.sub(
+        lambda m: "".join("\n" if ch == "\n" else " " for ch in m.group(0)), raw_doc
+    )
+    directives: list[str] = []
+    governed = sorted(doc_to_files[doc_rel])
+    for line_no, line in enumerate(masked_doc.splitlines(), 1):
+      stripped = " ".join(line.split())
+      if not stripped:
+        continue
+      if len(directives) < 8 and DOC_DIRECTIVE_RE.search(stripped):
+        directives.append(f"L{line_no}: {stripped[:160]}")
+      for del_p in sorted(deleted_paths):
+        bname = Path(del_p).name
+        if del_p in line or (len(bname) >= 5 and f"`{bname}`" in line):
+          drift_candidates.append({
+              "doc_path": doc_rel,
+              "doc_line": line_no,
+              "kind": "deleted_path",
+              "token": del_p,
+              "source_file": del_p,
+              "doc_excerpt": stripped[:140],
+          })
+      for src_f in governed:
+        for fl in sorted(removed_flags.get(src_f, ())):
+          if re.search(rf"(?<![A-Za-z0-9_]){re.escape(fl)}\b", line):
+            drift_candidates.append({
+                "doc_path": doc_rel,
+                "doc_line": line_no,
+                "kind": "removed_cli_flag",
+                "token": fl,
+                "source_file": src_f,
+                "doc_excerpt": stripped[:140],
+            })
+        for sym in sorted(removed_syms.get(src_f, ())):
+          if re.search(rf"\b{re.escape(sym)}\b", line):
+            drift_candidates.append({
+                "doc_path": doc_rel,
+                "doc_line": line_no,
+                "kind": "removed_or_renamed_symbol",
+                "token": sym,
+                "source_file": src_f,
+                "doc_excerpt": stripped[:140],
+            })
+
+    governing_docs.append({
+        "doc_path": doc_rel,
+        "co_updated": doc_rel in changed_set,
+        "governed_files": governed,
+        "directives": directives,
+    })
+
+  return {
+      "no_doc_sync_reason": "",
+      "governing_docs": governing_docs,
+      "drift_candidates": drift_candidates,
+  }
 
 
 def _number_lines(raw_text: str) -> str:
@@ -730,6 +956,7 @@ def _render_context_md(
     ledger_md: str,
     constraints: list[str],
     history_siblings: list[dict] | None = None,
+    doc_drift: dict | None = None,
 ) -> str:
   """Formats <out_dir>/context.md for Turn 1 parallel ingestion by audit shards."""
   repo_root = source.get("repo_root")
@@ -751,6 +978,24 @@ def _render_context_md(
       f"with {', '.join(f'`{p}`' for p in item['paired_with'])})"
       for item in (history_siblings or [])
   ] or ["- (none detected)"]
+  drift_info = doc_drift or {}
+  doc_lines: list[str] = []
+  if drift_info.get("no_doc_sync_reason"):
+    doc_lines.append(f"- Skipped via `NO_DOC_SYNC={drift_info['no_doc_sync_reason']}`")
+  else:
+    for gd in drift_info.get("governing_docs") or []:
+      state_lbl = "co-updated in diff" if gd.get("co_updated") else "untouched in diff"
+      gov_str = ", ".join(f"`{p}`" for p in gd.get("governed_files") or [])
+      doc_lines.append(f"- `{gd['doc_path']}` ({state_lbl}; governs {gov_str})")
+      for dline in (gd.get("directives") or [])[:5]:
+        doc_lines.append(f"  - Directive ({dline})")
+    for dc in drift_info.get("drift_candidates") or []:
+      doc_lines.append(
+          f"- **[DRIFT `{dc['kind']}`]** `{dc['doc_path']}:L{dc['doc_line']}` still cites "
+          f"`{dc['token']}` (removed/renamed in `{dc['source_file']}`): \"{dc['doc_excerpt']}\""
+      )
+  if not doc_lines:
+    doc_lines.append("- (no governing docs or drift detected)")
   constraint_lines = [
       f"{idx}. {c}" for idx, c in enumerate(constraints, 1)
   ] or ["(No transcript provided or 0 USER_INPUT turns found)"]
@@ -779,6 +1024,9 @@ def _render_context_md(
 
 ### History-RAG Co-Modified Production Siblings (Untouched in Diff)
 {chr(10).join(sibling_lines)}
+
+### Governing Docs & Doc <-> Code Drift Check (R4)
+{chr(10).join(doc_lines)}
 
 ### Skipped Binary / Generated / Deleted Files
 {chr(10).join(skip_lines)}
@@ -849,6 +1097,7 @@ def stage_context(
 
   if source["status"].upper() == "ABANDONED":
     staged_index, skipped, history_siblings = [], [], []
+    doc_drift = {"no_doc_sync_reason": "", "governing_docs": [], "drift_candidates": []}
     (out_dir / "files_bundle.md").write_text(
         "# Post-Patch Files Skipped (CL ABANDONED)\n", encoding="utf-8"
     )
@@ -857,6 +1106,13 @@ def stage_context(
         out_dir, changed_paths, deleted_paths, binary_paths, diff_ranges, source["fetch_file"]
     )
     history_siblings = _compute_comodified_siblings(source.get("repo_root"), changed_paths)
+    doc_drift = compute_governing_doc_drift(
+        source.get("repo_root"),
+        changed_paths,
+        deleted_paths,
+        patch_text,
+        source.get("commit_msg") or "",
+    )
 
   topology, shards = _classify_shard_topology(
       changed_paths, insertions, deletions, source["status"]
@@ -864,6 +1120,7 @@ def stage_context(
   context_md = _render_context_md(
       source, out_dir, file_stats, insertions, deletions, topology,
       shards, staged_index, skipped, ledger_md, constraints, history_siblings,
+      doc_drift,
   )
   (out_dir / "context.md").write_text(context_md, encoding="utf-8")
 
@@ -878,6 +1135,9 @@ def stage_context(
       "prior_refutations_count": len(ledger_entries),
       "user_constraints_count": len(constraints),
       "history_rag_siblings": history_siblings,
+      "governing_docs": doc_drift["governing_docs"],
+      "doc_code_drift": doc_drift["drift_candidates"],
+      "no_doc_sync_reason": doc_drift["no_doc_sync_reason"],
       "recommended_topology": topology, "recommended_shards": shards,
       "out_dir": str(out_dir),
       "artifacts": {
